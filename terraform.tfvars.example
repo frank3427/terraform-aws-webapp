@@ -22,7 +22,19 @@ key_name = "your-key-pair-name"
 db_root_password        = "your-strong-root-password"
 db_replication_user     = "replicator"
 db_replication_password = "your-strong-replication-password"
+db_app_password         = "your-strong-app-password"  # must differ from root password
 
 # Bastion Host Configuration
 bastion_instance_type = "t3.micro"
-bastion_allowed_cidrs = ["0.0.0.0/0"]  # Restrict this to your IP ranges for security
+# REQUIRED: SSH access to the bastion. List your office/VPN CIDR ranges.
+# 0.0.0.0/0 is rejected by validation.
+bastion_allowed_cidrs = ["203.0.113.0/24"]
+
+# HTTPS (optional)
+# Request/import a certificate in AWS Certificate Manager (same region) and
+# set its ARN here. The ALB will then serve HTTPS and redirect HTTP to HTTPS.
+# acm_certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/xxxx"
+
+# Security toggles
+enable_waf              = true   # AWS WAF managed rules on the ALB (~$10-15/mo)
+alb_deletion_protection = true   # set false before terraform destroy

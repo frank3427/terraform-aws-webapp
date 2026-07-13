@@ -43,6 +43,25 @@ output "bastion_public_dns" {
   value       = aws_instance.bastion.public_dns
 }
 
+output "db_backup_bucket" {
+  description = "S3 bucket receiving nightly encrypted database backups"
+  value       = aws_s3_bucket.db_backups.bucket
+}
+
+output "waf_web_acl_arn" {
+  description = "ARN of the WAF web ACL attached to the load balancer (empty if disabled)"
+  value       = var.enable_waf ? aws_wafv2_web_acl.main[0].arn : ""
+}
+
+output "db_secret_parameters" {
+  description = "SSM Parameter Store paths holding the database secrets"
+  value = {
+    root_password        = aws_ssm_parameter.db_root_password.name
+    replication_password = aws_ssm_parameter.db_replication_password.name
+    app_password         = aws_ssm_parameter.db_app_password.name
+  }
+}
+
 output "ssh_connection_commands" {
   description = "SSH connection commands for accessing servers"
   value = {

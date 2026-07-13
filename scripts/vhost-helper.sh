@@ -19,11 +19,11 @@ execute_on_all_servers() {
     for server in "${servers[@]}"; do
         echo "Executing on $server: $command"
         if [ -n "$JUMP_HOST" ]; then
-            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
                 -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
                 "$SSH_USER@$server" "$command"
         else
-            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
                 "$SSH_USER@$server" "$command"
         fi
         echo "---"
@@ -33,38 +33,33 @@ execute_on_all_servers() {
 # Function to create a virtual host
 create_vhost() {
     local domain="$1"
-    local ssl="$2"
-    local email="$3"
-    
+    local email="$2"
+
     if [ -z "$domain" ]; then
-        echo "Usage: $0 create <domain> [ssl] [email]"
+        echo "Usage: $0 create <domain> [admin-email]"
         exit 1
     fi
-    
+
     echo "Creating virtual host for: $domain"
-    
+
     # Create vhost on first server (it will be shared via EFS)
     local first_server=$(echo $WEB_SERVERS | cut -d' ' -f1)
     local cmd="sudo vhost create $domain"
-    [ -n "$ssl" ] && cmd="$cmd $ssl"
     [ -n "$email" ] && cmd="$cmd $email"
-    
+
     if [ -n "$JUMP_HOST" ]; then
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
             -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
             "$SSH_USER@$first_server" "$cmd"
     else
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
             "$SSH_USER@$first_server" "$cmd"
     fi
-    
-    echo "Virtual host created. Synchronizing across all servers..."
-    sleep 5  # Allow EFS to propagate changes
-    
-    # Sync on all servers
-    execute_on_all_servers "sudo vhost sync"
-    
-    echo "Virtual host $domain is now available on all servers!"
+
+    echo ""
+    echo "Virtual host created on $first_server."
+    echo "The remaining servers will sync automatically within one minute."
+    echo "To force an immediate sync everywhere, run: $0 sync"
 }
 
 # Function to list virtual hosts
@@ -73,11 +68,11 @@ list_vhosts() {
     local first_server=$(echo $WEB_SERVERS | cut -d' ' -f1)
     
     if [ -n "$JUMP_HOST" ]; then
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
             -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
             "$SSH_USER@$first_server" "sudo vhost list"
     else
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
             "$SSH_USER@$first_server" "sudo vhost list"
     fi
 }
@@ -85,33 +80,37 @@ list_vhosts() {
 # Function to remove a virtual host
 remove_vhost() {
     local domain="$1"
-    
+    local purge="$2"
+
     if [ -z "$domain" ]; then
-        echo "Usage: $0 remove <domain>"
+        echo "Usage: $0 remove <domain> [--purge]"
+        echo "By default website content is preserved; pass --purge to delete it."
         exit 1
     fi
-    
+
     echo "Removing virtual host for: $domain"
-    
-    # Remove from first server
-    local first_server=$(echo $WEB_SERVERS | cut -d' ' -f1)
-    
-    if [ -n "$JUMP_HOST" ]; then
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
-            -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
-            "$SSH_USER@$first_server" "echo 'y' | sudo vhost remove $domain"
-    else
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no \
-            "$SSH_USER@$first_server" "echo 'y' | sudo vhost remove $domain"
+    if [ "$purge" = "--purge" ]; then
+        echo "WARNING: --purge will permanently delete the website content."
     fi
-    
-    echo "Virtual host removed. Synchronizing across all servers..."
-    sleep 5  # Allow EFS to propagate changes
-    
-    # Sync on all servers
-    execute_on_all_servers "sudo vhost sync"
-    
-    echo "Virtual host $domain has been removed from all servers!"
+
+    # Remove from first server (config removal propagates via EFS)
+    local first_server=$(echo $WEB_SERVERS | cut -d' ' -f1)
+    local cmd="sudo vhost remove $domain"
+    [ "$purge" = "--purge" ] && cmd="$cmd --purge"
+
+    if [ -n "$JUMP_HOST" ]; then
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+            -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
+            "$SSH_USER@$first_server" "$cmd"
+    else
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+            "$SSH_USER@$first_server" "$cmd"
+    fi
+
+    echo ""
+    echo "Virtual host removed on $first_server."
+    echo "The remaining servers will stop serving it within one minute."
+    echo "To force an immediate sync everywhere, run: $0 sync"
 }
 
 # Function to sync virtual hosts
@@ -124,7 +123,7 @@ sync_vhosts() {
 # Function to check status
 check_status() {
     echo "Checking virtual host status on all servers..."
-    execute_on_all_servers "sudo systemctl status vhost-watcher --no-pager"
+    execute_on_all_servers "sudo systemctl status vhost-sync.timer --no-pager"
     echo ""
     execute_on_all_servers "sudo apache2ctl -S"
 }
@@ -158,15 +157,15 @@ case "$1" in
         echo "  JUMP_HOST=\"bastion-ip\"      # Optional: bastion host IP"
         echo ""
         echo "Commands:"
-        echo "  create <domain> [ssl] [email]  - Create a new virtual host"
+        echo "  create <domain> [admin-email]  - Create a new virtual host"
         echo "  list                           - List all virtual hosts"
-        echo "  remove <domain>                - Remove a virtual host"
-        echo "  sync                           - Synchronize vhosts across servers"
-        echo "  status                         - Check vhost watcher and Apache status"
+        echo "  remove <domain> [--purge]      - Remove a virtual host (--purge deletes content)"
+        echo "  sync                           - Synchronize vhosts across servers now"
+        echo "  status                         - Check vhost sync timer and Apache status"
         echo ""
         echo "Examples:"
         echo "  $0 create example.com"
-        echo "  $0 create secure.com ssl admin@secure.com"
+        echo "  $0 create example.com admin@example.com"
         echo "  $0 list"
         echo "  $0 remove example.com"
         echo "  $0 sync"

@@ -1,11 +1,18 @@
 resource "aws_instance" "bastion" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.bastion_instance_type
-  key_name                   = var.key_name
-  vpc_security_group_ids     = [aws_security_group.bastion.id]
-  subnet_id                  = aws_subnet.public[0].id
+  key_name                    = var.key_name
+  vpc_security_group_ids      = [aws_security_group.bastion.id]
+  subnet_id                   = aws_subnet.public[0].id
   associate_public_ip_address = true
-  user_data                  = local.bastion_user_data
+  user_data                   = local.bastion_user_data
+  iam_instance_profile        = aws_iam_instance_profile.bastion.name
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
 
   root_block_device {
     volume_type = "gp3"

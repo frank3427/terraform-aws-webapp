@@ -8,11 +8,24 @@ DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 # Install MariaDB
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     mariadb-server \
-    mariadb-client \
-    awscli
+    mariadb-client
+
+# Install AWS CLI v2 (awscli deb was removed from the Ubuntu archive in 24.04+)
+snap install aws-cli --classic
+
+# ---------------------------------------------------------------------------
+# Fetch secrets from SSM Parameter Store using the instance IAM role.
+# Secrets are intentionally NOT embedded in user data, which is readable by
+# anyone with ec2:DescribeInstanceAttribute.
+# ---------------------------------------------------------------------------
+export AWS_DEFAULT_REGION="${region}"
+AWS=/snap/bin/aws
+
+DB_ROOT_PASSWORD=$($AWS ssm get-parameter --name "${ssm_prefix}/db/root_password" --with-decryption --query Parameter.Value --output text)
+DB_REPL_PASSWORD=$($AWS ssm get-parameter --name "${ssm_prefix}/db/replication_password" --with-decryption --query Parameter.Value --output text)
+DB_APP_PASSWORD=$($AWS ssm get-parameter --name "${ssm_prefix}/db/app_password" --with-decryption --query Parameter.Value --output text)
 
 # Secure MariaDB installation
-mysql -e "UPDATE mysql.user SET Password = PASSWORD('${db_root_password}') WHERE User = 'root'"
 mysql -e "DROP USER IF EXISTS ''@'localhost'"
 mysql -e "DROP USER IF EXISTS ''@'$(hostname)'"
 mysql -e "DROP DATABASE IF EXISTS test"
@@ -62,50 +75,78 @@ systemctl enable mariadb
 sleep 10
 
 # Set root password
-mysql -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${db_root_password}')"
+mysql -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('$DB_ROOT_PASSWORD')"
 
-# Create replication user
-mysql -u root -p'${db_root_password}' -e "
-CREATE USER '${db_replication_user}'@'%' IDENTIFIED BY '${db_replication_password}';
-GRANT REPLICATION SLAVE ON *.* TO '${db_replication_user}'@'%';
+# Store root credentials in /root/.my.cnf (mode 600) so that subsequent
+# commands and cron jobs never carry the password on the command line
+# (visible in process listings) or inside world-readable scripts.
+cat > /root/.my.cnf << MYCNF
+[client]
+user=root
+password=$DB_ROOT_PASSWORD
+MYCNF
+chmod 600 /root/.my.cnf
+
+# Create replication user, restricted to the peer master only
+mysql -e "
+CREATE USER IF NOT EXISTS '${db_replication_user}'@'${master2_ip}' IDENTIFIED BY '$DB_REPL_PASSWORD';
+GRANT REPLICATION SLAVE ON *.* TO '${db_replication_user}'@'${master2_ip}';
 FLUSH PRIVILEGES;
 "
 
-# Create application database
-mysql -u root -p'${db_root_password}' -e "
-CREATE DATABASE IF NOT EXISTS webapp;
-GRANT ALL PRIVILEGES ON webapp.* TO 'webapp_user'@'%' IDENTIFIED BY '${db_root_password}';
-FLUSH PRIVILEGES;
+# Create application database and least-privilege application user.
+# The app user has its own password (never the root password) and can only
+# connect from the web server subnets.
+mysql -e "CREATE DATABASE IF NOT EXISTS webapp;"
+%{ for pattern in web_host_patterns ~}
+mysql -e "
+CREATE USER IF NOT EXISTS 'webapp_user'@'${pattern}' IDENTIFIED BY '$DB_APP_PASSWORD';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP, REFERENCES ON webapp.* TO 'webapp_user'@'${pattern}';
 "
+%{ endfor ~}
+mysql -e "FLUSH PRIVILEGES;"
 
 # Wait for Master 2 to be ready (simple wait, in production use better coordination)
 sleep 120
 
 # Setup replication from Master 2
-mysql -u root -p'${db_root_password}' -e "
+mysql -e "
 CHANGE MASTER TO
     MASTER_HOST='${master2_ip}',
     MASTER_USER='${db_replication_user}',
-    MASTER_PASSWORD='${db_replication_password}',
+    MASTER_PASSWORD='$DB_REPL_PASSWORD',
     MASTER_USE_GTID=slave_pos;
 START SLAVE;
 "
 
-# Create backup script
-cat > /usr/local/bin/mariadb_backup.sh << 'EOL'
+# ---------------------------------------------------------------------------
+# Backups: nightly compressed dump, shipped to an encrypted, versioned S3
+# bucket so backups survive instance loss or compromise. Credentials come
+# from /root/.my.cnf; no passwords appear in this script or in cron.
+# ---------------------------------------------------------------------------
+cat > /usr/local/bin/mariadb_backup.sh << EOL
 #!/bin/bash
+set -e
+export AWS_DEFAULT_REGION="${region}"
 BACKUP_DIR="/var/backups/mariadb"
-DATE=$(date +%Y%m%d_%H%M%S)
-mkdir -p $BACKUP_DIR
+DATE=\$(date +%Y%m%d_%H%M%S)
+HOST=\$(hostname)
+mkdir -p "\$BACKUP_DIR"
+chmod 700 "\$BACKUP_DIR"
 
-mysqldump -u root -p'${db_root_password}' --all-databases --routines --triggers \
-    --single-transaction --master-data=2 > "$BACKUP_DIR/full_backup_$DATE.sql"
+mysqldump --all-databases --routines --triggers \
+    --single-transaction --master-data=2 | gzip > "\$BACKUP_DIR/full_backup_\$DATE.sql.gz"
+chmod 600 "\$BACKUP_DIR/full_backup_\$DATE.sql.gz"
 
-# Keep only last 7 days of backups
-find $BACKUP_DIR -name "*.sql" -mtime +7 -delete
+# Ship to S3 (bucket enforces encryption at rest and 35-day retention)
+/snap/bin/aws s3 cp "\$BACKUP_DIR/full_backup_\$DATE.sql.gz" \
+    "s3://${backup_bucket}/db-backups/\$HOST/full_backup_\$DATE.sql.gz"
+
+# Keep only last 7 days locally
+find "\$BACKUP_DIR" -name "*.sql.gz" -mtime +7 -delete
 EOL
 
-chmod +x /usr/local/bin/mariadb_backup.sh
+chmod 700 /usr/local/bin/mariadb_backup.sh
 
 # Add backup to cron (daily at 2 AM)
 echo "0 2 * * * root /usr/local/bin/mariadb_backup.sh" >> /etc/crontab

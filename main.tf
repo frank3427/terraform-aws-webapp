@@ -6,6 +6,19 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  # RECOMMENDED for production: the state file contains the database
+  # passwords (Terraform stores variable values in state even when marked
+  # sensitive). Keep state in an encrypted, access-controlled remote
+  # backend rather than on local disk:
+  #
+  # backend "s3" {
+  #   bucket       = "your-terraform-state-bucket"
+  #   key          = "webapp/production/terraform.tfstate"
+  #   region       = "us-west-2"
+  #   encrypt      = true
+  #   use_lockfile = true
+  # }
 }
 
 provider "aws" {
@@ -22,7 +35,7 @@ data "aws_ami" "ubuntu" {
 
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server-*"]
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-resolute-26.04-amd64-server-*"]
   }
 
   filter {

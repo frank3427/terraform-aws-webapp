@@ -124,18 +124,18 @@ The bastion host includes a complete virtual host management system:
 ```bash
 # Create virtual hosts
 vhost create example.com
-vhost create secure.com ssl admin@secure.com
+vhost create example.com admin@example.com
 
 # List all virtual hosts
 vhost list
 
-# Remove virtual hosts
+# Remove virtual hosts (content preserved; add --purge to delete it)
 vhost remove example.com
 
 # Synchronize configurations
 vhost sync
 
-# Check vhost watcher status
+# Check vhost sync timer status
 vhost status
 ```
 
@@ -143,11 +143,11 @@ vhost status
 
 #### Creating Virtual Hosts
 ```bash
-# HTTP virtual host
+# Virtual host (HTTPS is terminated at the load balancer via ACM)
 vhost create mysite.com
 
-# HTTPS virtual host (requires SSL certificates)
-vhost create securesite.com ssl admin@securesite.com
+# With a ServerAdmin email
+vhost create mysite.com admin@mysite.com
 ```
 
 #### Managing Existing Virtual Hosts
@@ -206,9 +206,19 @@ Enter password:
 # Connect to specific database server
 mysql -h 10.0.21.10 -u root -p  # Master 1
 mysql -h 10.0.22.10 -u root -p  # Master 2
+```
 
-# Connect to application database
-mysql -h 10.0.21.10 -u webapp_user -p webapp
+Note: `webapp_user` is restricted to connections from the web server
+subnets, so application-user logins must be tested from a web server, not
+from the bastion.
+
+Database passwords live in SSM Parameter Store (see the
+`db_secret_parameters` Terraform output). Admins with permission can
+retrieve one when needed:
+
+```bash
+aws ssm get-parameter --name /webapp/production/db/root_password \
+    --with-decryption --query Parameter.Value --output text
 ```
 
 ### Database Administration
@@ -300,16 +310,15 @@ done
 ```bash
 # Upload to EFS (accessible by all web servers)
 scp -r /local/path/to/website/ web1:/var/www/shared/vhosts/mysite.com/public_html/
-
-# Upload SSL certificates
-scp mycert.crt web1:/var/www/shared/ssl-certs/
-scp mykey.key web1:/var/www/shared/ssl-certs/
 ```
+
+TLS certificates live in AWS Certificate Manager and are never uploaded
+to servers or EFS.
 
 #### Download Files from Servers
 ```bash
-# Download logs
-scp web1:/var/www/shared/vhosts/mysite.com/logs/access.log ./
+# Download logs (per-vhost logs are local to each server)
+scp web1:/var/log/apache2/mysite.com-access.log ./
 scp web1:/var/log/apache2/error.log ./
 
 # Download database backups
@@ -321,7 +330,7 @@ scp db1:/var/backups/mariadb/*.sql ./
 #### Real-time Log Monitoring
 ```bash
 # Apache access logs
-ssh web1 "tail -f /var/www/shared/vhosts/mysite.com/logs/access.log"
+ssh web1 "tail -f /var/log/apache2/mysite.com-access.log"
 
 # Apache error logs  
 ssh web1 "tail -f /var/log/apache2/error.log"
@@ -380,10 +389,11 @@ The bastion host is configured with optimized SSH settings:
 - Password authentication disabled
 - Public key authentication enabled
 - Connection timeouts configured
-- Host key checking disabled for internal networks
+- Host keys for internal servers accepted on first connection (`accept-new`) and verified thereafter
 
 ### Access Control
-- Restrict bastion host access by updating `bastion_allowed_cidrs` in terraform.tfvars
+- Bastion SSH access is limited to the CIDR ranges in `bastion_allowed_cidrs` (required; open-to-world is rejected by validation)
+- SSM Session Manager is also available on all instances as an auditable, key-less alternative to SSH
 - Use IAM roles for AWS service access
 - Regularly rotate SSH keys
 - Monitor access logs
@@ -409,9 +419,10 @@ The bastion host is configured with optimized SSH settings:
 3. Check if target servers are running
 
 #### Virtual Host Changes Not Syncing
-1. Check vhost-watcher service: `ssh web1 "sudo systemctl status vhost-watcher"`
-2. Manual sync: `vhost sync`
-3. Check EFS mount: `ssh web1 "df -h | grep shared"`
+1. Check the sync timer: `ssh web1 "sudo systemctl status vhost-sync.timer"`
+2. Check the last sync run: `ssh web1 "sudo journalctl -u vhost-sync.service -n 20"`
+3. Manual sync: `vhost sync`
+4. Check EFS mount: `ssh web1 "mountpoint /var/www/shared"`
 
 #### Database Connection Issues
 1. Check MariaDB service: `ssh db1 "sudo systemctl status mariadb"`

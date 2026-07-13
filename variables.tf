@@ -82,7 +82,35 @@ variable "bastion_instance_type" {
 }
 
 variable "bastion_allowed_cidrs" {
-  description = "CIDR blocks allowed to SSH to bastion host"
+  description = "CIDR blocks allowed to SSH to the bastion host. Must be set explicitly (e.g. your office/VPN ranges); 0.0.0.0/0 is rejected."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition     = length(var.bastion_allowed_cidrs) > 0 && alltrue([for c in var.bastion_allowed_cidrs : c != "0.0.0.0/0" && c != "::/0"])
+    error_message = "bastion_allowed_cidrs must list specific CIDR ranges; exposing SSH to 0.0.0.0/0 is not allowed."
+  }
+}
+
+variable "db_app_password" {
+  description = "Password for the application database user (webapp_user). Must differ from the root password."
+  type        = string
+  sensitive   = true
+}
+
+variable "acm_certificate_arn" {
+  description = "ARN of an ACM certificate for HTTPS termination at the load balancer. When set, the ALB serves HTTPS on 443 and redirects HTTP to HTTPS. Leave empty to serve HTTP only."
+  type        = string
+  default     = ""
+}
+
+variable "enable_waf" {
+  description = "Attach an AWS WAFv2 web ACL (AWS managed common, known-bad-inputs, SQLi and IP-reputation rules) to the load balancer. Recommended for transactional workloads. Adds ~USD 10-15/month."
+  type        = bool
+  default     = true
+}
+
+variable "alb_deletion_protection" {
+  description = "Enable deletion protection on the load balancer. Must be disabled before terraform destroy."
+  type        = bool
+  default     = true
 }

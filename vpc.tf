@@ -118,10 +118,20 @@ resource "aws_route_table" "private" {
 }
 
 resource "aws_route_table" "database" {
+  count = length(var.db_subnet_cidrs)
+
   vpc_id = aws_vpc.main.id
 
+  # Outbound-only internet access via NAT: required for package installs,
+  # fetching secrets from SSM, and shipping backups to S3. No inbound path
+  # exists; the subnets remain private.
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
   tags = {
-    Name        = "${var.project_name}-${var.environment}-db-rt"
+    Name        = "${var.project_name}-${var.environment}-db-rt-${count.index + 1}"
     Environment = var.environment
   }
 }
@@ -144,5 +154,5 @@ resource "aws_route_table_association" "database" {
   count = length(aws_subnet.database)
 
   subnet_id      = aws_subnet.database[count.index].id
-  route_table_id = aws_route_table.database.id
+  route_table_id = aws_route_table.database[count.index].id
 }

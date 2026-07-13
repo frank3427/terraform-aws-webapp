@@ -16,11 +16,13 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     vim \
     tree \
     jq \
-    awscli \
     python3 \
     python3-pip \
     mysql-client \
     postgresql-client
+
+# Install AWS CLI v2 (awscli deb was removed from the Ubuntu archive in 24.04+)
+snap install aws-cli --classic
 
 # Install AWS Session Manager plugin for enhanced security
 cd /tmp
@@ -41,7 +43,7 @@ mkdir -p /opt/management-tools
 cat > /etc/ssh/ssh_config.d/internal.conf << 'EOL'
 # Configuration for internal server access
 Host 10.0.*.*
-    StrictHostKeyChecking no
+    StrictHostKeyChecking accept-new
     UserKnownHostsFile=/dev/null
     ServerAliveInterval 60
     ServerAliveCountMax 3
@@ -157,25 +159,22 @@ case "$1" in
     create)
         shift
         domain="$1"
-        ssl="$2"
-        email="$3"
-        
+        email="$2"
+
         if [ -z "$domain" ]; then
-            echo "Usage: $0 create <domain> [ssl] [email]"
+            echo "Usage: $0 create <domain> [admin-email]"
             exit 1
         fi
-        
+
         cmd="sudo vhost create $domain"
-        [ -n "$ssl" ] && cmd="$cmd $ssl"
         [ -n "$email" ] && cmd="$cmd $email"
-        
+
         echo "Creating virtual host for: $domain"
         execute_on_first_server "$cmd"
-        
-        echo "Synchronizing across all servers..."
-        sleep 5
-        execute_on_all_servers "sudo vhost sync"
-        echo "Virtual host $domain is now available on all servers!"
+
+        echo ""
+        echo "Virtual host created. Remaining servers sync automatically within one minute."
+        echo "Run '$0 sync' to force an immediate sync everywhere."
         ;;
     list)
         echo "Listing virtual hosts from first server..."
@@ -184,19 +183,23 @@ case "$1" in
     remove)
         shift
         domain="$1"
-        
+        purge="$2"
+
         if [ -z "$domain" ]; then
-            echo "Usage: $0 remove <domain>"
+            echo "Usage: $0 remove <domain> [--purge]"
+            echo "By default website content is preserved; pass --purge to delete it."
             exit 1
         fi
-        
+
+        cmd="sudo vhost remove $domain"
+        [ "$purge" = "--purge" ] && cmd="$cmd --purge"
+
         echo "Removing virtual host for: $domain"
-        execute_on_first_server "echo 'y' | sudo vhost remove $domain"
-        
-        echo "Synchronizing across all servers..."
-        sleep 5
-        execute_on_all_servers "sudo vhost sync"
-        echo "Virtual host $domain has been removed from all servers!"
+        execute_on_first_server "$cmd"
+
+        echo ""
+        echo "Virtual host removed. Remaining servers sync automatically within one minute."
+        echo "Run '$0 sync' to force an immediate sync everywhere."
         ;;
     sync)
         echo "Synchronizing virtual hosts across all servers..."
@@ -205,22 +208,22 @@ case "$1" in
         ;;
     status)
         echo "Checking virtual host status on all servers..."
-        execute_on_all_servers "sudo systemctl status vhost-watcher --no-pager -l"
+        execute_on_all_servers "sudo systemctl status vhost-sync.timer --no-pager -l"
         ;;
     *)
         echo "Virtual Host Remote Management"
         echo "Usage: $0 {create|list|remove|sync|status}"
         echo ""
         echo "Commands:"
-        echo "  create <domain> [ssl] [email]  - Create a new virtual host"
+        echo "  create <domain> [admin-email]  - Create a new virtual host"
         echo "  list                           - List all virtual hosts"
-        echo "  remove <domain>                - Remove a virtual host"
-        echo "  sync                           - Synchronize vhosts across servers"
-        echo "  status                         - Check vhost watcher status"
+        echo "  remove <domain> [--purge]      - Remove a virtual host (--purge deletes content)"
+        echo "  sync                           - Synchronize vhosts across servers now"
+        echo "  status                         - Check vhost sync timer status"
         echo ""
         echo "Examples:"
         echo "  $0 create example.com"
-        echo "  $0 create secure.com ssl admin@secure.com"
+        echo "  $0 create example.com admin@example.com"
         echo "  $0 list"
         echo "  $0 remove example.com"
         exit 1
@@ -251,11 +254,11 @@ for i in "${!WEB_SERVERS[@]}"; do
         else
             echo "  Apache: ✗ Not running"
         fi
-        # Check vhost watcher
-        if ssh ubuntu@$server "systemctl is-active vhost-watcher" 2>/dev/null | grep -q "active"; then
-            echo "  VHost Watcher: ✓ Running"
+        # Check vhost sync timer
+        if ssh ubuntu@$server "systemctl is-active vhost-sync.timer" 2>/dev/null | grep -q "active"; then
+            echo "  VHost Sync Timer: ✓ Running"
         else
-            echo "  VHost Watcher: ✗ Not running"
+            echo "  VHost Sync Timer: ✗ Not running"
         fi
     else
         echo "✗ Offline"

@@ -6,38 +6,71 @@ This document provides detailed instructions for managing Apache virtual hosts i
 
 The infrastructure includes an automated virtual host management system that:
 - Stores all website content and configurations on EFS (shared across all servers)
-- Automatically synchronizes Apache configurations across all web servers
+- Automatically synchronizes Apache configurations across all web servers (within one minute)
 - Provides simple command-line tools for virtual host management
-- Supports both HTTP and HTTPS virtual hosts
-- Monitors configuration changes and auto-applies them
+- Terminates HTTPS at the load balancer using AWS Certificate Manager (ACM)
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     EFS File System                        │
-│  /var/www/shared/                                           │
-│  ├── vhosts/           # Website content                    │
-│  ├── vhost-configs/    # Apache configurations             │
-│  └── ssl-certs/        # SSL certificates                  │
-└─────────────────────────────────────────────────────────────┘
+                         Internet
                             │
-                    NFS Mount (2049)
+              ┌─────────────┴─────────────┐
+              │  Application Load Balancer │
+              │  :443 HTTPS (ACM cert)     │
+              │  :80  HTTP → 301 to HTTPS  │
+              └─────────────┬─────────────┘
+                     HTTP :80 (internal)
                             │
 ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
 │ Web Server 1│  │ Web Server 2│  │ Web Server 3│
 │             │  │             │  │             │
-│ vhost-      │  │ vhost-      │  │ vhost-      │
-│ watcher     │  │ watcher     │  │ watcher     │
-│ service     │  │ service     │  │ service     │
-└─────────────┘  └─────────────┘  └─────────────┘
+│ vhost-sync  │  │ vhost-sync  │  │ vhost-sync  │
+│ timer (1min)│  │ timer (1min)│  │ timer (1min)│
+└──────┬──────┘  └──────┬──────┘  └──────┬──────┘
+       └────────────────┼────────────────┘
+                 NFS Mount (2049)
+                        │
+┌─────────────────────────────────────────────────┐
+│                 EFS File System                  │
+│  /var/www/shared/                                │
+│  ├── vhosts/           # Website content         │
+│  └── vhost-configs/    # Apache configurations   │
+└─────────────────────────────────────────────────┘
 ```
+
+TLS is terminated at the ALB. Instances only ever serve plain HTTP on
+port 80, so there are no certificates or private keys on the servers or
+on EFS. Applications that need to know the original scheme should check
+the `X-Forwarded-Proto` header (set to `https` by the ALB).
+
+## HTTPS Setup
+
+1. Request (or import) a certificate in **AWS Certificate Manager** in the
+   same region as the ALB. For multiple sites, add each domain to the
+   certificate as a Subject Alternative Name, or use a wildcard.
+2. Set the certificate ARN in `terraform.tfvars`:
+   ```hcl
+   acm_certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/xxxx"
+   ```
+3. Run `terraform apply`. The ALB will serve HTTPS on 443 and redirect all
+   HTTP traffic to HTTPS automatically.
+4. Point your domains' DNS at the ALB (alias/CNAME to the
+   `load_balancer_dns` output).
+
+ACM renews its certificates automatically — there is no certbot, no cron,
+and nothing to copy between servers.
+
+To add a new domain later: add it to the ACM certificate (or issue a new
+certificate and update `acm_certificate_arn`), then create the vhost as
+described below.
 
 ## Command Reference
 
 ### Basic Commands
 
-All virtual host management is done through the `vhost` command:
+All virtual host management is done through the `vhost` command on any web
+server:
 
 ```bash
 vhost {create|sync|list|remove}
@@ -45,9 +78,9 @@ vhost {create|sync|list|remove}
 
 ### Creating Virtual Hosts
 
-#### HTTP Virtual Host
 ```bash
 sudo vhost create example.com
+sudo vhost create example.com admin@example.com   # sets ServerAdmin
 ```
 
 This creates:
@@ -56,19 +89,11 @@ This creates:
 - Configuration: `/var/www/shared/vhost-configs/example.com.conf`
 - Default index.php with server information
 
-#### HTTPS Virtual Host
-```bash
-sudo vhost create secure.com ssl admin@secure.com
-```
-
-This creates an HTTPS virtual host with:
-- HTTP to HTTPS redirect
-- SSL configuration pointing to `/var/www/shared/ssl-certs/`
-- Same directory structure as HTTP vhost
-
-**Note**: You need to manually place SSL certificates in the ssl-certs directory.
+The server you ran the command on picks the vhost up immediately; the
+other web servers sync automatically within one minute.
 
 ### Listing Virtual Hosts
+
 ```bash
 sudo vhost list
 ```
@@ -80,38 +105,43 @@ Sample output:
 Domain: example.com
   Document Root: /var/www/shared/vhosts/example.com/public_html
   Configuration: /var/www/shared/vhost-configs/example.com.conf
-  SSL: Disabled
-  Apache Status: Enabled
-
-Domain: secure.com
-  Document Root: /var/www/shared/vhosts/secure.com/public_html
-  Configuration: /var/www/shared/vhost-configs/secure.com.conf
-  SSL: Enabled
   Apache Status: Enabled
 ```
 
 ### Synchronizing Virtual Hosts
+
+Synchronization is automatic: every web server runs a `vhost-sync.timer`
+systemd timer that applies the shared configuration once per minute. To
+apply changes immediately on the current server:
+
 ```bash
 sudo vhost sync
 ```
 
-This command:
+The sync:
 - Scans `/var/www/shared/vhost-configs/` for configuration files
-- Creates symlinks in `/etc/apache2/sites-available/`
-- Enables all virtual host sites
-- Tests Apache configuration
-- Reloads Apache if configuration is valid
+- Creates symlinks in `/etc/apache2/sites-available/` and enables them
+- Cleans up links for vhosts that have been removed
+- Tests the Apache configuration and reloads Apache if it is valid
+- Skips (and reports) if the EFS mount is unavailable
+
+> **Why a timer instead of file-watching?** inotify only sees changes made
+> by the local machine — changes written by *other* NFS clients never
+> generate events. Polling is the reliable way to keep every server
+> converged on the shared configuration.
 
 ### Removing Virtual Hosts
+
 ```bash
-sudo vhost remove example.com
+sudo vhost remove example.com            # keeps website content
+sudo vhost remove example.com --purge    # also deletes website content
 ```
 
-This will:
-- Disable the Apache site
-- Remove the configuration file
-- Ask if you want to remove website content
-- Reload Apache
+This disables the site, removes the shared configuration file, and reloads
+Apache. Other servers stop serving the vhost on their next timer run
+(within one minute). **Website content is preserved unless you pass
+`--purge` or confirm the interactive prompt** — content deletion is
+irreversible and affects all servers, since content lives on shared EFS.
 
 ## Directory Structure
 
@@ -120,87 +150,52 @@ This will:
 ```
 /var/www/shared/
 ├── vhosts/                    # Website content directories
-│   ├── default/               # Default virtual host
+│   ├── default/               # Default virtual host (ALB health checks)
 │   │   └── index.php
-│   ├── example.com/
-│   │   ├── public_html/       # Document root for example.com
-│   │   │   ├── index.php
-│   │   │   ├── .htaccess
-│   │   │   └── assets/
-│   │   └── logs/              # Per-domain log files
-│   │       ├── access.log
-│   │       └── error.log
-│   └── secure.com/
-│       ├── public_html/
-│       └── logs/
-├── vhost-configs/             # Apache configuration files
-│   ├── default.conf
-│   ├── example.com.conf
-│   └── secure.com.conf
-└── ssl-certs/                 # SSL certificates
-    ├── secure.com.crt
-    ├── secure.com.key
-    └── intermediate.crt
+│   └── example.com/
+│       └── public_html/       # Document root for example.com
+│           ├── index.php
+│           ├── .htaccess
+│           └── assets/
+└── vhost-configs/             # Apache configuration files
+    ├── default.conf
+    └── example.com.conf
 ```
 
-## SSL Certificate Management
+### Logs Are Local, Not on EFS
 
-### Adding SSL Certificates
+Per-vhost Apache logs are written to the local disk of each web server at
+`/var/log/apache2/<domain>-access.log` and `<domain>-error.log`, not to
+EFS. Multiple servers appending to the same NFS file interleaves and
+corrupts log lines, so each server keeps its own. Local logs are rotated
+weekly by logrotate. To view traffic for a domain across the fleet, check
+each server (or ship logs to CloudWatch Logs).
 
-1. **Upload certificates to EFS**:
-```bash
-# From any web server
-sudo cp your-domain.crt /var/www/shared/ssl-certs/
-sudo cp your-domain.key /var/www/shared/ssl-certs/
-sudo chown www-data:www-data /var/www/shared/ssl-certs/*
-sudo chmod 644 /var/www/shared/ssl-certs/*.crt
-sudo chmod 600 /var/www/shared/ssl-certs/*.key
-```
-
-2. **Create or update virtual host with SSL**:
-```bash
-sudo vhost create your-domain.com ssl admin@your-domain.com
-```
-
-### Let's Encrypt Integration
-
-For automated SSL certificate management, you can integrate with Let's Encrypt:
-
-```bash
-# Install certbot
-sudo apt-get update
-sudo apt-get install certbot python3-certbot-apache
-
-# Get certificate
-sudo certbot --apache -d your-domain.com -d www.your-domain.com
-
-# Move certificates to EFS
-sudo cp /etc/letsencrypt/live/your-domain.com/fullchain.pem /var/www/shared/ssl-certs/your-domain.com.crt
-sudo cp /etc/letsencrypt/live/your-domain.com/privkey.pem /var/www/shared/ssl-certs/your-domain.com.key
-```
+Client IPs in the logs are the real client addresses: Apache is configured
+with `mod_remoteip` to trust `X-Forwarded-For` from the ALB.
 
 ## Automatic Synchronization
 
-### vhost-watcher Service
+### vhost-sync.timer
 
-Each web server runs a `vhost-watcher` service that:
-- Monitors `/var/www/shared/vhost-configs/` for changes
-- Automatically runs `vhost sync` when changes are detected
-- Ensures all servers have the same virtual host configurations
+Each web server runs a systemd timer that executes the sync script one
+minute after boot and every minute thereafter. The service unit declares
+`RequiresMountsFor=/var/www/shared`, so it never runs before EFS is
+mounted.
 
-Check service status:
+Check timer status:
 ```bash
-sudo systemctl status vhost-watcher
+sudo systemctl status vhost-sync.timer
+sudo systemctl list-timers vhost-sync.timer
 ```
 
-View service logs:
+View sync logs:
 ```bash
-sudo journalctl -u vhost-watcher -f
+sudo journalctl -u vhost-sync.service -f
 ```
 
 ### Manual Synchronization
 
-If automatic synchronization fails, manually sync on all servers:
 ```bash
 # On each web server
 sudo vhost sync
@@ -208,7 +203,8 @@ sudo vhost sync
 
 ## Remote Management
 
-Use the `vhost-helper.sh` script for remote management from your local machine.
+Use the `vhost-helper.sh` script for remote management from your local
+machine, or the equivalent tooling pre-installed on the bastion host.
 
 ### Setup
 
@@ -231,19 +227,22 @@ chmod +x scripts/vhost-helper.sh
 # Create virtual host remotely
 ./scripts/vhost-helper.sh create newsite.com
 
-# Create SSL virtual host remotely
-./scripts/vhost-helper.sh create secure-site.com ssl admin@secure-site.com
+# Create with an admin email (ServerAdmin)
+./scripts/vhost-helper.sh create newsite.com admin@newsite.com
 
 # List virtual hosts
 ./scripts/vhost-helper.sh list
 
-# Remove virtual host
+# Remove virtual host (content preserved)
 ./scripts/vhost-helper.sh remove oldsite.com
 
-# Force synchronization
+# Remove virtual host AND delete its content — irreversible!
+./scripts/vhost-helper.sh remove oldsite.com --purge
+
+# Force immediate synchronization on all servers
 ./scripts/vhost-helper.sh sync
 
-# Check status
+# Check sync timer and Apache status
 ./scripts/vhost-helper.sh status
 ```
 
@@ -252,29 +251,34 @@ chmod +x scripts/vhost-helper.sh
 ### Common Issues
 
 1. **Virtual host not appearing**
+   - Wait one minute (timer interval), or run `sudo vhost sync` manually
    - Check if configuration exists: `ls /var/www/shared/vhost-configs/`
-   - Run manual sync: `sudo vhost sync`
    - Check Apache syntax: `sudo apache2ctl configtest`
+   - Check the last sync run: `sudo journalctl -u vhost-sync.service -n 20`
 
 2. **EFS mount issues**
-   - Check mount: `df -h | grep shared`
+   - Check mount: `mountpoint /var/www/shared` or `df -h | grep shared`
    - Remount if needed: `sudo mount -a`
-   - Check EFS security groups
+   - Check EFS security groups (NFS 2049 from web servers)
+   - Note: sync intentionally refuses to run while EFS is unmounted, so a
+     mount outage will not tear down existing vhosts
 
 3. **Permission issues**
-   - Fix ownership: `sudo chown -R www-data:www-data /var/www/shared/`
+   - Fix ownership: `sudo chown -R www-data:www-data /var/www/shared/vhosts/`
    - Fix permissions: `sudo chmod -R 755 /var/www/shared/vhosts/`
 
-4. **SSL certificate issues**
-   - Check certificate files exist and have correct permissions
-   - Verify certificate paths in vhost configuration
-   - Test SSL configuration: `sudo apache2ctl configtest`
+4. **HTTPS issues**
+   - Verify the ACM certificate covers the domain (check SANs)
+   - Verify `acm_certificate_arn` is set and `terraform apply` has run
+   - Confirm DNS points at the ALB, not at an instance
+   - Remember: `curl https://<instance-ip>` will fail by design — TLS only
+     exists at the ALB
 
 ### Log Files
 
 - **Apache error logs**: `/var/log/apache2/error.log`
-- **Per-vhost logs**: `/var/www/shared/vhosts/[domain]/logs/`
-- **vhost-watcher logs**: `sudo journalctl -u vhost-watcher`
+- **Per-vhost logs**: `/var/log/apache2/<domain>-{access,error}.log` (local to each server)
+- **Sync logs**: `sudo journalctl -u vhost-sync.service`
 - **System logs**: `/var/log/syslog`
 
 ### Checking Configuration
@@ -294,11 +298,10 @@ sudo apache2ctl -t -D DUMP_VHOSTS
 
 1. **Always use the vhost command** instead of manually editing Apache configurations
 2. **Test configurations** before deploying to production
-3. **Backup EFS regularly** - consider AWS Backup for EFS
-4. **Monitor disk space** on EFS to avoid performance issues
-5. **Use meaningful domain names** and organize content logically
-6. **Keep SSL certificates updated** and automate renewal where possible
-7. **Monitor vhost-watcher service** to ensure automatic synchronization works
+3. **Backup EFS regularly** — consider AWS Backup for EFS
+4. **Be careful with `--purge`** — content deletion is shared across all servers and irreversible
+5. **Keep certificates in ACM** — never place private keys on EFS or instances
+6. **Monitor the sync timer** (`systemctl list-timers`) to ensure automatic synchronization works
 
 ## Advanced Configuration
 
@@ -312,14 +315,25 @@ To add custom Apache directives to a virtual host:
 sudo nano /var/www/shared/vhost-configs/example.com.conf
 ```
 3. Add custom directives within the VirtualHost block
-4. The changes will automatically sync to all servers
+4. Changes apply locally on the next `vhost sync` and on all other servers
+   within one minute
+
+### Detecting HTTPS in Applications
+
+Because TLS terminates at the ALB, PHP applications should trust the
+forwarded scheme header rather than `$_SERVER['HTTPS']`:
+
+```php
+$isHttps = ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
+```
 
 ### Load Balancer Health Checks
 
-The load balancer performs health checks on `/` of each server. Ensure your default virtual host responds correctly:
+The load balancer performs health checks on `/` of each server over HTTP.
+The default virtual host answers these requests; make sure it always
+returns 200:
 
 ```bash
-# Check default vhost response
 curl -H "Host: default.local" http://localhost/
 ```
 
@@ -336,4 +350,5 @@ ServerAlias subdomain.example.com
 ServerAlias alternative-domain.com
 ```
 
-Changes will automatically synchronize across all servers.
+Remember to also add the new names to the ACM certificate so HTTPS covers
+them. Changes synchronize across all servers within one minute.
