@@ -41,7 +41,7 @@ enable_monitoring        = true
 monitoring_instance_type = "t3.small"
 # Email address for Prometheus alerts (confirm the SNS subscription email
 # AWS sends after apply).
-alert_email = "alerts@diasranch.com"
+alert_email = "alerts@changeme.com"
 
 # EFS throughput: "elastic" (default) avoids burst-credit throttling on
 # small filesystems; "bursting" is cheaper for large/lightly-used data.
