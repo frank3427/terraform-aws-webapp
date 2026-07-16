@@ -20,6 +20,7 @@ This Terraform project deploys a highly available web application infrastructure
 ├── flow_logs.tf             # VPC Flow Logs to CloudWatch
 ├── security_groups.tf       # All SGs and rules (restricted egress)
 ├── iam.tf                   # Instance roles/profiles, SSM SecureString secrets
+├── ssh_keys.tf              # Per-role generated SSH key pairs (no pre-existing key needed)
 ├── ec2.tf                   # Web launch template + ASG, database instances (IMDSv2)
 ├── bastion.tf               # Bastion host
 ├── efs.tf                   # Shared storage + automatic AWS Backup
@@ -392,6 +393,7 @@ See **SECURITY.md** for the full security model. Highlights:
 - AWS WAF with rate limiting + managed rules on the ALB (decisions logged); HTTPS via ACM; hardened ALB with access logs
 - Automatic security patching (unattended-upgrades) on all instances
 - IMDSv2 enforced; least-privilege IAM instance roles; SSM Session Manager available
+- Per-role generated SSH keys (bastion/web/database/monitoring) — a leaked bastion key opens nothing internal; keys and `sshcfg` are gitignored
 - Restricted egress on all security groups; bastion SSH limited to explicit admin CIDRs
 - All EBS volumes and EFS encrypted at rest; nightly DB backups to an encrypted S3 bucket
 - VPC Flow Logs enabled (90-day retention)
@@ -432,7 +434,7 @@ deliberately protected with `prevent_destroy`.
 
 ### Common Issues
 
-1. **Key Pair Not Found**: Ensure the specified key pair exists in your AWS region
+1. **SSH access fails**: Keys are generated into `sshkeys_generated/` on apply; use `ssh -F sshcfg <host>`. If the files are missing (e.g., fresh clone), run `terraform apply` — it rewrites them from state
 2. **Permission Denied**: Check AWS credentials and IAM permissions
 3. **Resource Limits**: Verify AWS service limits for your account
 4. **Health Check Failures**: Check security groups and application status
