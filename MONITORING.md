@@ -33,13 +33,14 @@ retained for 30 days.
 
 ## Accessing Grafana
 
-1. Open a tunnel through the bastion (or use the `grafana_tunnel_command`
-   Terraform output):
+1. Open a tunnel through the bastion using the generated `./sshcfg` (or
+   copy the `grafana_tunnel_command` Terraform output):
    ```bash
-   ssh -i your-key.pem \
+   ssh -F sshcfg \
        -L 3000:<monitoring-private-ip>:3000 \
        -L 9090:<monitoring-private-ip>:9090 \
-       ubuntu@<bastion-public-ip>
+       -L 9093:<monitoring-private-ip>:9093 \
+       bastion
    ```
    Alternative without SSH: SSM port forwarding
    ```bash

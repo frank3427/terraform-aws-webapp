@@ -63,11 +63,6 @@ variable "db_instance_type" {
   default     = "t3.large"
 }
 
-variable "key_name" {
-  description = "AWS Key Pair name"
-  type        = string
-}
-
 variable "db_root_password" {
   description = "Root password for MariaDB"
   type        = string

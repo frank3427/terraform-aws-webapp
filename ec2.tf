@@ -11,7 +11,7 @@ resource "aws_launch_template" "web" {
   name_prefix   = "${var.project_name}-${var.environment}-web-"
   image_id      = var.web_ami_id != "" ? var.web_ami_id : data.aws_ami.ubuntu.id
   instance_type = var.instance_type
-  key_name      = var.key_name
+  key_name      = aws_key_pair.role["web"].key_name
 
   vpc_security_group_ids = [aws_security_group.web.id]
 
@@ -120,7 +120,7 @@ resource "aws_instance" "database" {
 
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.db_instance_type
-  key_name               = var.key_name
+  key_name               = aws_key_pair.role["database"].key_name
   vpc_security_group_ids = [aws_security_group.database.id]
   subnet_id              = aws_subnet.database[count.index].id
   # Pinned host address (.10) derived from each DB subnet's CIDR so custom
@@ -156,10 +156,10 @@ resource "aws_instance" "database" {
   }
 
   lifecycle {
-    # Never replace a live database master because a setup script or AMI
-    # changed. New user_data/AMI applies only to deliberately replaced
+    # Never replace a live database master because a setup script, AMI, or
+    # key pair changed. New values apply only to deliberately replaced
     # instances (`terraform apply -replace`).
-    ignore_changes = [ami, user_data]
+    ignore_changes = [ami, user_data, key_name]
   }
 
   # Secrets must exist in SSM before the instance boots and fetches them

@@ -39,8 +39,18 @@ Internet → Bastion Host (Public Subnet) → Private Resources
 ## Connecting to the Bastion Host
 
 ### Initial Connection
+Terraform generates per-role SSH keys (`sshkeys_generated/`) and a
+ready-made ssh config (`./sshcfg`):
 ```bash
-ssh -i your-key.pem ubuntu@[bastion-public-ip]
+ssh -F sshcfg bastion
+```
+
+To hop onward from the bastion (the `web`/`db`/`connect-*` tools below),
+add the internal keys to your agent first — the bastion entry in `sshcfg`
+enables agent forwarding, so internal private keys are never stored on
+the bastion:
+```bash
+ssh-add sshkeys_generated/*-web sshkeys_generated/*-database
 ```
 
 The bastion host public IP is available in your Terraform outputs:

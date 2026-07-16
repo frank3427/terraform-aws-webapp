@@ -23,6 +23,10 @@ crash.*.log
 packer/packer_cache/
 packer/*.pkrvars.hcl
 
+# Generated SSH material - private keys, never commit
+sshkeys_generated/
+sshcfg
+
 # OS / editor noise
 .DS_Store
 Thumbs.db

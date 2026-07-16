@@ -76,6 +76,13 @@ items that remain your responsibility, with transactional workloads in mind.
 - All instances run with **least-privilege IAM roles**; the database role
   can read only the three DB secrets and write only to the backup prefix of
   the backup bucket
+- **Per-role SSH keys**: Terraform generates a separate ED25519 key pair
+  for each role (bastion, web, database, monitoring) — the bastion key
+  cannot open internal hosts and vice versa. Private keys land in
+  `sshkeys_generated/` (gitignored, mode 0600) and in Terraform state,
+  which is one more reason the state bucket must be access-controlled.
+  Internal keys are never stored on the bastion; onward hops use SSH
+  agent forwarding
 - **SSM Session Manager** is available on all instances (auditable shell
   access through IAM, no inbound ports); consider it over SSH for routine
   access
@@ -118,20 +125,18 @@ items that remain your responsibility, with transactional workloads in mind.
 
 Identified but not yet implemented, in suggested priority order:
 
-1. **SSH key strategy** — one key pair opens every instance. Use separate
-   keys for bastion vs. internal hosts, or prefer SSM Session Manager
-   (already enabled) and disable SSH entirely.
-2. **Account-level controls** (outside this repo's scope): CloudTrail
+1. **Account-level controls** (outside this repo's scope): CloudTrail
    enabled in all regions, GuardDuty, MFA on IAM users, and strict access
    control on the Terraform state bucket, SSM parameters, and backup
    buckets.
-3. **WAF rate-limit tuning** — the 2000 req/5min default may need
+2. **WAF rate-limit tuning** — the 2000 req/5min default may need
    adjustment for legitimate high-traffic clients or shared office NAT IPs;
    review the WAF logs during the first weeks.
 
 (Resolved in earlier iterations: unconfigured CloudWatch agent removed —
 Prometheus is the metrics plane; alerting implemented via Prometheus
-rules → Alertmanager → SNS, see MONITORING.md.)
+rules → Alertmanager → SNS, see MONITORING.md; single shared SSH key
+replaced with Terraform-generated per-role key pairs, see ssh_keys.tf.)
 
 ## Known Trade-offs
 

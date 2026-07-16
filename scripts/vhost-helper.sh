@@ -8,8 +8,10 @@ set -e
 # Configuration - Update these values from your Terraform outputs
 JUMP_HOST=""    # Bastion host public IP (terraform output bastion_public_ip)
 WEB_SERVERS="auto"  # Space-separated private IPs, or "auto" to discover via AWS CLI
-SSH_KEY=""      # Path to your SSH private key
+SSH_KEY=""      # Path to the web SSH key, e.g. sshkeys_generated/<project>-<environment>-web
 SSH_USER="ubuntu"
+# Note: with the generated ./sshcfg you can also skip this helper's SSH
+# plumbing entirely: ssh -F sshcfg ubuntu@<web-ip> 'sudo vhost list'
 
 # Used only when WEB_SERVERS="auto"
 AWS_REGION="${AWS_REGION:-us-west-2}"

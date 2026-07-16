@@ -66,7 +66,7 @@ output "monitoring_private_ip" {
 
 output "grafana_tunnel_command" {
   description = "SSH tunnel command to open Grafana (3000), Prometheus (9090) and Alertmanager (9093) locally"
-  value       = var.enable_monitoring ? "ssh -i your-key.pem -L 3000:${aws_instance.monitoring[0].private_ip}:3000 -L 9090:${aws_instance.monitoring[0].private_ip}:9090 -L 9093:${aws_instance.monitoring[0].private_ip}:9093 ubuntu@${aws_instance.bastion.public_ip}" : ""
+  value       = var.enable_monitoring ? "ssh -F sshcfg -L 3000:${aws_instance.monitoring[0].private_ip}:3000 -L 9090:${aws_instance.monitoring[0].private_ip}:9090 -L 9093:${aws_instance.monitoring[0].private_ip}:9093 bastion" : ""
 }
 
 output "grafana_admin_password_parameter" {
@@ -93,14 +93,65 @@ output "db_secret_parameters" {
   }
 }
 
+# ---------------------------------------------------------------------------
+# Generated ssh config (./sshcfg) wiring the per-role generated keys and
+# ProxyJump through the bastion - same approach as CR3_demo. Usage:
+#   ssh -F sshcfg bastion
+#   ssh -F sshcfg db1
+#   ssh -F sshcfg ubuntu@<web-private-ip>   # ASG web servers, dynamic IPs
+# ---------------------------------------------------------------------------
+
+resource "local_file" "sshconfig" {
+  content = <<-EOF
+    Host bastion
+        Hostname ${aws_eip.bastion.public_ip}
+        User ubuntu
+        IdentityFile ${local.ssh_key_file["bastion"]}
+        ForwardAgent yes
+        StrictHostKeyChecking accept-new
+
+    Host db1
+        Hostname ${aws_instance.database[0].private_ip}
+        User ubuntu
+        IdentityFile ${local.ssh_key_file["database"]}
+        ProxyJump bastion
+        StrictHostKeyChecking accept-new
+
+    Host db2
+        Hostname ${aws_instance.database[1].private_ip}
+        User ubuntu
+        IdentityFile ${local.ssh_key_file["database"]}
+        ProxyJump bastion
+        StrictHostKeyChecking accept-new
+    %{if var.enable_monitoring}
+    Host monitoring
+        Hostname ${aws_instance.monitoring[0].private_ip}
+        User ubuntu
+        IdentityFile ${local.ssh_key_file["monitoring"]}
+        ProxyJump bastion
+        StrictHostKeyChecking accept-new
+    %{endif}
+    # Web servers are ASG-managed (dynamic IPs): ssh -F sshcfg ubuntu@<ip>.
+    # The wildcard matches VPC addresses and jumps through the bastion.
+    Host ${join(".", slice(split(".", split("/", var.vpc_cidr)[0]), 0, 2))}.*
+        User ubuntu
+        IdentityFile ${local.ssh_key_file["web"]}
+        IdentityFile ${local.ssh_key_file["database"]}
+        IdentityFile ${local.ssh_key_file["monitoring"]}
+        ProxyJump bastion
+        StrictHostKeyChecking accept-new
+  EOF
+
+  filename        = "${path.module}/sshcfg"
+  file_permission = "0600"
+}
+
 output "ssh_connection_commands" {
-  description = "SSH connection commands for accessing servers (web servers: get the IP from the bastion's fleet tools or the AWS CLI, then use the same ProxyCommand pattern)"
+  description = "SSH access via the generated ./sshcfg (per-role keys in sshkeys_generated/)"
   value = {
-    bastion = "ssh -i your-key.pem ubuntu@${aws_eip.bastion.public_ip}"
-    web_servers = "ASG-managed; on the bastion run refresh-hosts / health-check, or: ssh -i your-key.pem -o ProxyCommand=\"ssh -i your-key.pem -W %h:%p ubuntu@${aws_eip.bastion.public_ip}\" ubuntu@<web-private-ip>"
-    database_servers = [
-      for i, instance in aws_instance.database :
-      "ssh -i your-key.pem -o ProxyCommand=\"ssh -i your-key.pem -W %h:%p ubuntu@${aws_eip.bastion.public_ip}\" ubuntu@${instance.private_ip}"
-    ]
+    bastion          = "ssh -F sshcfg bastion"
+    web_servers      = "ssh -F sshcfg ubuntu@<web-private-ip>  (IPs: bastion 'hosts' tool, or tag-filtered describe-instances)"
+    database_servers = ["ssh -F sshcfg db1", "ssh -F sshcfg db2"]
+    monitoring       = var.enable_monitoring ? "ssh -F sshcfg monitoring" : ""
   }
 }
