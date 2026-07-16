@@ -1,0 +1,29 @@
+# Terraform state and workspaces - state contains secrets, never commit
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+.terraform.tfstate.lock.info
+
+# Real variable values (passwords, CIDRs) - only the .example is tracked
+terraform.tfvars
+*.auto.tfvars
+
+# Bootstrap config keeps its own local state
+bootstrap/.terraform/
+bootstrap/terraform.tfstate*
+
+# Plan and crash artifacts
+*.tfplan
+crash.log
+crash.*.log
+
+# Packer
+packer/packer_cache/
+packer/*.pkrvars.hcl
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp

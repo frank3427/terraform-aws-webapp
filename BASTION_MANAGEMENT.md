@@ -25,15 +25,14 @@ Internet → Bastion Host (Public Subnet) → Private Resources
              ↓ SSH (Port 22)
     ┌─────────────────────────────────────────────┐
     │  🌐 Web Servers (Private Subnet)           │
-    │  - 10.0.11.10 (web1)                       │
-    │  - 10.0.12.10 (web2)                       │
-    │  - 10.0.13.10 (web3)                       │
+    │  - web servers (dynamic IPs,               │
+    │    count set by web_server_count)          │
     └─────────────────────────────────────────────┘
              ↓ SSH (Port 22)
     ┌─────────────────────────────────────────────┐
     │  🗄️ Database Servers (Private Subnet)       │
-    │  - 10.0.21.10 (db1)                        │
-    │  - 10.0.22.10 (db2)                        │
+    │  - db masters (pinned .10 host address     │
+    │    in each database subnet)                │
     └─────────────────────────────────────────────┘
 ```
 
@@ -58,8 +57,7 @@ Upon connection, you'll see a welcome screen with quick command references:
 ║                     AWS Web Application Infrastructure                       ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║                                                                              ║
-║  🌐 Web Servers:           web1, web2, web3                                 ║
-║  🗄️  Database Servers:      db1, db2                                         ║
+║  Hosts are discovered automatically from EC2 tags (any fleet size).         ║
 ║  🔧 Management Tools:       /opt/management-tools/                          ║
 ║                                                                              ║
 ║  Quick Commands:                                                             ║
@@ -78,13 +76,13 @@ The bastion host provides convenient aliases for quick server access:
 
 ```bash
 # Web servers
-web1    # SSH to web server 1 (10.0.11.10)
-web2    # SSH to web server 2 (10.0.12.10)
-web3    # SSH to web server 3 (10.0.13.10)
+hosts   # List all discovered servers with their current IPs
+web 1   # SSH to web server 1 (web 2, web 3, ... for any count)
 
 # Database servers
-db1     # SSH to database server 1 (10.0.21.10)
-db2     # SSH to database server 2 (10.0.22.10)
+db 1    # SSH to database server 1
+db 2    # SSH to database server 2
+refresh-hosts  # Force fleet re-discovery (otherwise cached ~5 minutes)
 ```
 
 ### Interactive Connection Menus
@@ -97,9 +95,11 @@ connect-web
 This displays an interactive menu:
 ```
 Available Web Servers:
-1. web-server-1 (10.0.11.10)
-2. web-server-2 (10.0.12.10)
-3. web-server-3 (10.0.13.10)
+1. webapp-production-web (10.0.11.x)
+2. webapp-production-web (10.0.12.x)
+3. webapp-production-web (10.0.13.x)
+(entries reflect the live fleet; ASG instances share one Name tag and are
+distinguished by IP - the numbering is by discovery order)
 Select server (1-3):
 ```
 
@@ -257,15 +257,15 @@ This runs a comprehensive infrastructure health check:
 2024-01-15 10:30:00
 
 === Web Servers ===
-Web Server 1 (10.0.11.10): ✓ Online
+webapp-production-web (10.0.11.x): ✓ Online
   Apache: ✓ Running
   VHost Watcher: ✓ Running
 
-Web Server 2 (10.0.12.10): ✓ Online
+webapp-production-web (10.0.12.x): ✓ Online
   Apache: ✓ Running
   VHost Watcher: ✓ Running
 
-Web Server 3 (10.0.13.10): ✓ Online
+webapp-production-web (10.0.13.x): ✓ Online
   Apache: ✓ Running
   VHost Watcher: ✓ Running
 
@@ -360,7 +360,8 @@ ssh db1 "df -h"
 #### Restart Services
 ```bash
 # Restart Apache on all web servers
-for server in 10.0.11.10 10.0.12.10 10.0.13.10; do
+source /opt/management-tools/lib/hosts.sh && ensure_hosts
+for server in "${WEB_IPS[@]}"; do
     ssh ubuntu@$server "sudo systemctl restart apache2"
 done
 
@@ -370,13 +371,19 @@ ssh db2 "sudo systemctl restart mariadb"
 ```
 
 #### Update System Packages
+Security updates install automatically every day on all instances via
+`unattended-upgrades` (security pocket only, no automatic reboots). Manual
+full upgrades are only needed for non-security package updates or to apply
+kernel updates with a reboot:
+
 ```bash
 # Update web servers
-for server in 10.0.11.10 10.0.12.10 10.0.13.10; do
+source /opt/management-tools/lib/hosts.sh && ensure_hosts
+for server in "${WEB_IPS[@]}"; do
     ssh ubuntu@$server "sudo apt update && sudo apt upgrade -y"
 done
 
-# Update database servers
+# Update database servers (reboot one at a time to keep replication up)
 for server in 10.0.21.10 10.0.22.10; do
     ssh ubuntu@$server "sudo apt update && sudo apt upgrade -y"
 done
@@ -399,9 +406,8 @@ The bastion host is configured with optimized SSH settings:
 - Monitor access logs
 
 ### Monitoring and Alerting
-- CloudWatch agent installed and configured
-- System metrics and logs sent to CloudWatch
-- Set up CloudWatch alarms for critical metrics
+- node_exporter metrics scraped by the Prometheus monitoring server
+- Alerting via Prometheus/Alertmanager → SNS (see MONITORING.md)
 - Regular health checks and status monitoring
 
 ## Troubleshooting
@@ -433,7 +439,6 @@ The bastion host is configured with optimized SSH settings:
 - **Bastion logs**: `/var/log/management/`
 - **SSH logs**: `/var/log/auth.log`
 - **System logs**: `/var/log/syslog`
-- **CloudWatch agent**: `/opt/aws/amazon-cloudwatch-agent/logs/`
 
 ## Tools and Scripts Location
 

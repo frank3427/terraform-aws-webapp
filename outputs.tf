@@ -13,9 +13,15 @@ output "load_balancer_zone_id" {
   value       = aws_lb.main.zone_id
 }
 
-output "web_server_ips" {
-  description = "Private IP addresses of web servers"
-  value       = aws_instance.web[*].private_ip
+# Web servers are managed by an ASG; their IPs change as instances are
+# replaced. Discover them at any time with:
+#   aws ec2 describe-instances --filters "Name=tag:Type,Values=WebServer" \
+#     "Name=instance-state-name,Values=running" \
+#     --query 'Reservations[].Instances[].PrivateIpAddress'
+# (scripts/vhost-helper.sh and the bastion tools do this automatically)
+output "web_asg_name" {
+  description = "Name of the web tier Auto Scaling Group"
+  value       = aws_autoscaling_group.web.name
 }
 
 output "database_server_ips" {
@@ -53,6 +59,31 @@ output "waf_web_acl_arn" {
   value       = var.enable_waf ? aws_wafv2_web_acl.main[0].arn : ""
 }
 
+output "monitoring_private_ip" {
+  description = "Private IP of the Prometheus/Grafana monitoring server (empty if disabled)"
+  value       = var.enable_monitoring ? aws_instance.monitoring[0].private_ip : ""
+}
+
+output "grafana_tunnel_command" {
+  description = "SSH tunnel command to open Grafana (3000), Prometheus (9090) and Alertmanager (9093) locally"
+  value       = var.enable_monitoring ? "ssh -i your-key.pem -L 3000:${aws_instance.monitoring[0].private_ip}:3000 -L 9090:${aws_instance.monitoring[0].private_ip}:9090 -L 9093:${aws_instance.monitoring[0].private_ip}:9093 ubuntu@${aws_instance.bastion.public_ip}" : ""
+}
+
+output "grafana_admin_password_parameter" {
+  description = "SSM parameter holding the generated Grafana admin password (aws ssm get-parameter --with-decryption --name <this>)"
+  value       = var.enable_monitoring ? "${local.ssm_prefix}/monitoring/grafana_admin_password" : ""
+}
+
+output "alerts_sns_topic_arn" {
+  description = "SNS topic receiving Prometheus alerts (empty if monitoring disabled)"
+  value       = var.enable_monitoring ? aws_sns_topic.alerts[0].arn : ""
+}
+
+output "provisioning_bucket" {
+  description = "S3 bucket holding instance provisioning scripts (fetched at boot)"
+  value       = aws_s3_bucket.provisioning.bucket
+}
+
 output "db_secret_parameters" {
   description = "SSM Parameter Store paths holding the database secrets"
   value = {
@@ -63,15 +94,12 @@ output "db_secret_parameters" {
 }
 
 output "ssh_connection_commands" {
-  description = "SSH connection commands for accessing servers"
+  description = "SSH connection commands for accessing servers (web servers: get the IP from the bastion's fleet tools or the AWS CLI, then use the same ProxyCommand pattern)"
   value = {
     bastion = "ssh -i your-key.pem ubuntu@${aws_eip.bastion.public_ip}"
-    web_servers = [
-      for i, instance in aws_instance.web : 
-      "ssh -i your-key.pem -o ProxyCommand=\"ssh -i your-key.pem -W %h:%p ubuntu@${aws_eip.bastion.public_ip}\" ubuntu@${instance.private_ip}"
-    ]
+    web_servers = "ASG-managed; on the bastion run refresh-hosts / health-check, or: ssh -i your-key.pem -o ProxyCommand=\"ssh -i your-key.pem -W %h:%p ubuntu@${aws_eip.bastion.public_ip}\" ubuntu@<web-private-ip>"
     database_servers = [
-      for i, instance in aws_instance.database : 
+      for i, instance in aws_instance.database :
       "ssh -i your-key.pem -o ProxyCommand=\"ssh -i your-key.pem -W %h:%p ubuntu@${aws_eip.bastion.public_ip}\" ubuntu@${instance.private_ip}"
     ]
   }

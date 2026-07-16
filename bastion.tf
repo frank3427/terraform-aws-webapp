@@ -26,7 +26,16 @@ resource "aws_instance" "bastion" {
     Type        = "BastionHost"
   }
 
-  depends_on = [aws_internet_gateway.main]
+  lifecycle {
+    # A new Ubuntu AMI release must not silently replace the bastion on
+    # the next apply; replace deliberately via `terraform apply -replace`
+    ignore_changes = [ami]
+  }
+
+  depends_on = [
+    aws_internet_gateway.main,
+    aws_s3_object.provisioning
+  ]
 }
 
 resource "aws_eip" "bastion" {

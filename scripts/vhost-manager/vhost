@@ -1,0 +1,40 @@
+#!/bin/bash
+
+# Main vhost management command
+
+case "$1" in
+    create)
+        shift
+        /usr/local/bin/vhost-manager/create-vhost.sh "$@"
+        ;;
+    sync)
+        /usr/local/bin/vhost-manager/sync-vhosts.sh --force
+        ;;
+    list)
+        /usr/local/bin/vhost-manager/list-vhosts.sh
+        ;;
+    remove)
+        shift
+        /usr/local/bin/vhost-manager/remove-vhost.sh "$@"
+        ;;
+    *)
+        echo "Usage: vhost {create|sync|list|remove}"
+        echo ""
+        echo "Commands:"
+        echo "  create <domain> [admin-email]  - Create a new virtual host"
+        echo "  sync                           - Synchronize vhosts from EFS to this server"
+        echo "  list                           - List all virtual hosts"
+        echo "  remove <domain> [--purge]      - Remove a virtual host (--purge deletes content)"
+        echo ""
+        echo "TLS is terminated at the load balancer (ACM); vhosts serve HTTP on port 80."
+        echo "Other web servers pick up changes automatically within one minute."
+        echo ""
+        echo "Examples:"
+        echo "  vhost create example.com"
+        echo "  vhost create example.com admin@example.com"
+        echo "  vhost sync"
+        echo "  vhost list"
+        echo "  vhost remove example.com"
+        exit 1
+        ;;
+esac

@@ -15,6 +15,31 @@ resource "aws_wafv2_web_acl" "main" {
     allow {}
   }
 
+  # Rate limiting: blocks IPs exceeding 2000 requests per 5 minutes.
+  # First line of defense against credential stuffing and brute force on
+  # login/checkout endpoints, and blunt-force scraping/DoS.
+  rule {
+    name     = "rate-limit-per-ip"
+    priority = 5
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        limit              = 2000
+        aggregate_key_type = "IP"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "${var.project_name}-rate-limit"
+      sampled_requests_enabled   = true
+    }
+  }
+
   rule {
     name     = "aws-common-rule-set"
     priority = 10
@@ -120,4 +145,25 @@ resource "aws_wafv2_web_acl_association" "alb" {
 
   resource_arn = aws_lb.main.arn
   web_acl_arn  = aws_wafv2_web_acl.main[0].arn
+}
+
+# WAF logging: records which requests were blocked/allowed and by which
+# rule, needed both to investigate attacks and to tune false positives.
+# Log group name must start with "aws-waf-logs-".
+resource "aws_cloudwatch_log_group" "waf" {
+  count = var.enable_waf ? 1 : 0
+
+  name              = "aws-waf-logs-${var.project_name}-${var.environment}"
+  retention_in_days = 90
+
+  tags = {
+    Environment = var.environment
+  }
+}
+
+resource "aws_wafv2_web_acl_logging_configuration" "main" {
+  count = var.enable_waf ? 1 : 0
+
+  log_destination_configs = [aws_cloudwatch_log_group.waf[0].arn]
+  resource_arn            = aws_wafv2_web_acl.main[0].arn
 }

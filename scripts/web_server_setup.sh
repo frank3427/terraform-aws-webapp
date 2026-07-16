@@ -1,9 +1,34 @@
 #!/bin/bash
-set -e
+# Web server provisioning. Fetched from the provisioning S3 bucket and run
+# by the user-data bootstrap, which exports:
+#   EFS_ID  - EFS file system id to mount
+#   REGION  - AWS region
+# The vhost-manager scripts and lib/ helpers are staged by the bootstrap
+# under /opt/provisioning/scripts/.
+set -euo pipefail
+
+: "${EFS_ID:?EFS_ID must be set by the bootstrap}"
+: "${REGION:?REGION must be set by the bootstrap}"
+
+source /opt/provisioning/scripts/lib/fetch-release.sh
 
 # Update system
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+
+# Enable automatic security updates (instances are long-lived; launch-time
+# patching alone leaves CVEs unpatched for the instance lifetime)
+DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOL'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOL
+cat > /etc/apt/apt.conf.d/52unattended-upgrades-local << 'EOL'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+EOL
 
 # Install Apache, PHP, and EFS utilities
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -21,9 +46,6 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
     libapache2-mod-php \
     nfs-common \
     jq
-
-# Install AWS CLI v2 (awscli deb was removed from the Ubuntu archive in 24.04+)
-snap install aws-cli --classic
 
 # Enable Apache modules
 a2enmod rewrite
@@ -54,7 +76,7 @@ Header always set X-Frame-Options "SAMEORIGIN"
 Header always set Referrer-Policy "strict-origin-when-cross-origin"
 
 # HSTS, only on requests that arrived over HTTPS at the load balancer
-Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains" "expr=%%{HTTP:X-Forwarded-Proto} == 'https'"
+Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains" "expr=%{HTTP:X-Forwarded-Proto} == 'https'"
 EOL
 a2enconf security-hardening
 
@@ -65,11 +87,52 @@ for ini in /etc/php/*/apache2/php.ini /etc/php/*/cli/php.ini; do
     sed -i 's/^allow_url_include = On/allow_url_include = Off/' "$ini"
 done
 
+# ---------------------------------------------------------------------------
+# PHP performance tuning for code served from EFS
+#
+# All vhost PHP files live on NFS. Without OPcache doing the heavy lifting,
+# every request stats and re-reads scripts over the network. OPcache keeps
+# compiled scripts in memory and only revalidates them every 60s, and a
+# larger realpath cache avoids repeated path lookups against NFS.
+# Deployed content changes appear within 60s (or run
+# `systemctl reload apache2` to pick them up immediately).
+# ---------------------------------------------------------------------------
+for confdir in /etc/php/*/apache2/conf.d; do
+    [ -d "$confdir" ] || continue
+    cat > "$confdir/99-opcache-efs.ini" << 'EOL'
+opcache.enable=1
+opcache.memory_consumption=192
+opcache.interned_strings_buffer=16
+opcache.max_accelerated_files=20000
+opcache.validate_timestamps=1
+opcache.revalidate_freq=60
+EOL
+    cat > "$confdir/99-realpath-efs.ini" << 'EOL'
+realpath_cache_size=4096K
+realpath_cache_ttl=600
+EOL
+done
+
+# ---------------------------------------------------------------------------
+# Local-disk health check target. The ALB probes /healthz; it must not
+# depend on EFS (or PHP), otherwise an EFS stall fails health checks on
+# every instance simultaneously and the ALB drains the whole fleet.
+# ---------------------------------------------------------------------------
+mkdir -p /var/www/health
+echo "OK" > /var/www/health/index.html
+cat > /etc/apache2/conf-available/healthz.conf << 'EOL'
+Alias /healthz /var/www/health/index.html
+<Directory /var/www/health>
+    Require all granted
+</Directory>
+EOL
+a2enconf healthz
+
 # Create mount point for EFS
 mkdir -p /var/www/shared
 
 # Mount EFS file system
-echo "${efs_id}.efs.${region}.amazonaws.com:/ /var/www/shared nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0" >> /etc/fstab
+echo "$EFS_ID.efs.$REGION.amazonaws.com:/ /var/www/shared nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0" >> /etc/fstab
 mount -a
 
 # Create EFS directory structure if it doesn't exist
@@ -87,14 +150,17 @@ ln -sfn /var/www/shared/vhosts /var/www/vhosts
 chown -R www-data:www-data /var/www/shared/vhosts
 chmod -R 755 /var/www/shared/vhosts
 
-# Create default vhost if it doesn't exist
+# Create default vhost if it doesn't exist.
+# This page answers any request that doesn't match a configured domain
+# (including internet scanners hitting the ALB DNS name directly), so it
+# must reveal nothing about the stack. Never use phpinfo() here.
+# (ALB health checks hit /healthz, served from local disk above.)
 if [ ! -d /var/www/shared/vhosts/default ]; then
     mkdir -p /var/www/shared/vhosts/default
     cat > /var/www/shared/vhosts/default/index.php << 'EOL'
 <?php
-echo "<h1>Web Server: " . gethostname() . "</h1>";
-echo "<h2>Server Information</h2>";
-phpinfo();
+http_response_code(200);
+echo "OK";
 ?>
 EOL
     chown -R www-data:www-data /var/www/shared/vhosts/default
@@ -108,10 +174,10 @@ cat > /etc/apache2/sites-available/000-default-vhost.conf << 'EOL'
 <VirtualHost *:80>
     ServerName default.local
     DocumentRoot /var/www/vhosts/default
-    
-    ErrorLog $${APACHE_LOG_DIR}/default_error.log
-    CustomLog $${APACHE_LOG_DIR}/default_access.log combined
-    
+
+    ErrorLog ${APACHE_LOG_DIR}/default_error.log
+    CustomLog ${APACHE_LOG_DIR}/default_access.log combined
+
     <Directory /var/www/vhosts/default>
         Options Indexes FollowSymLinks
         AllowOverride All
@@ -123,299 +189,28 @@ EOL
 # Enable the default vhost
 a2ensite 000-default-vhost
 
-# Create vhost management directory
+# ---------------------------------------------------------------------------
+# vhost management tooling. The scripts are versioned in the repo under
+# scripts/vhost-manager/ and staged from S3 by the bootstrap; installing
+# them here (instead of heredocs in this script) keeps user data small and
+# lets script updates ship without touching instances.
+# ---------------------------------------------------------------------------
 mkdir -p /usr/local/bin/vhost-manager
-
-# Create vhost management script
-cat > /usr/local/bin/vhost-manager/create-vhost.sh << 'EOL'
-#!/bin/bash
-
-# Virtual Host Creation Script
-# Usage: ./create-vhost.sh <domain> [admin-email]
-#
-# TLS is terminated at the load balancer (ACM certificate), so all
-# instance-level vhosts listen on port 80 only.
-
-DOMAIN=$1
-ADMIN_EMAIL=$2
-
-if [ -z "$DOMAIN" ]; then
-    echo "Usage: $0 <domain> [admin-email]"
-    echo "Example: $0 example.com admin@example.com"
-    exit 1
-fi
-
-# Sanitize domain name
-SAFE_DOMAIN=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9.-]//g')
-VHOST_DIR="/var/www/shared/vhosts/$SAFE_DOMAIN"
-CONFIG_FILE="/var/www/shared/vhost-configs/$SAFE_DOMAIN.conf"
-
-echo "Creating virtual host for: $DOMAIN"
-
-# Create vhost directory structure
-mkdir -p "$VHOST_DIR/public_html"
-
-# Create default index.php
-cat > "$VHOST_DIR/public_html/index.php" << INDEXEOF
-<?php
-echo "<h1>Welcome to $DOMAIN</h1>";
-echo "<p>Virtual host is working correctly!</p>";
-echo "<p>Server: " . gethostname() . "</p>";
-echo "<p>Document Root: " . __DIR__ . "</p>";
-?>
-INDEXEOF
-
-# Set permissions
-chown -R www-data:www-data "$VHOST_DIR"
-chmod -R 755 "$VHOST_DIR"
-
-# Create Apache configuration
-# Logs are written to local disk (not EFS) because multiple servers writing
-# to the same NFS log file interleaves and corrupts entries. Local logs are
-# rotated by the /etc/logrotate.d/apache2-custom policy.
-cat > "$CONFIG_FILE" << CONFEOF
-<VirtualHost *:80>
-    ServerName $DOMAIN
-    ServerAlias www.$DOMAIN
-    $([ -n "$ADMIN_EMAIL" ] && echo "ServerAdmin $ADMIN_EMAIL")
-    DocumentRoot $VHOST_DIR/public_html
-
-    ErrorLog /var/log/apache2/$SAFE_DOMAIN-error.log
-    CustomLog /var/log/apache2/$SAFE_DOMAIN-access.log combined
-
-    <Directory $VHOST_DIR/public_html>
-        Options FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
-</VirtualHost>
-CONFEOF
-
-echo "Virtual host configuration created at: $CONFIG_FILE"
-echo "Document root: $VHOST_DIR/public_html"
-echo ""
-echo "This server will pick it up immediately; the other web servers"
-echo "sync automatically within one minute (vhost-sync.timer)."
-/usr/local/bin/vhost-manager/sync-vhosts.sh
-EOL
-
-# Create vhost synchronization script
-cat > /usr/local/bin/vhost-manager/sync-vhosts.sh << 'EOL'
-#!/bin/bash
-
-# Virtual Host Synchronization Script
-# This script syncs vhost configurations from EFS to local Apache.
-# It is idempotent and safe to run repeatedly (vhost-sync.timer runs it
-# every minute on every web server).
-
-VHOST_CONFIG_DIR="/var/www/shared/vhost-configs"
-APACHE_SITES_DIR="/etc/apache2/sites-available"
-APACHE_ENABLED_DIR="/etc/apache2/sites-enabled"
-
-# Refuse to run if EFS is not mounted, otherwise we would tear down
-# every vhost just because the share was briefly unavailable
-if ! mountpoint -q /var/www/shared; then
-    echo "EFS is not mounted at /var/www/shared; skipping sync."
-    exit 1
-fi
-
-echo "Synchronizing virtual hosts..."
-
-# Remove old symlinks in sites-available
-find "$APACHE_SITES_DIR" -name "vhost-*.conf" -type l -delete
-
-# Remove dangling symlinks in sites-enabled left behind by removed vhosts;
-# a dangling include makes apache2ctl configtest fail and blocks reloads
-find "$APACHE_ENABLED_DIR" -xtype l -delete
-
-# Create symlinks for all vhost configs in EFS
-for config_file in "$VHOST_CONFIG_DIR"/*.conf; do
-    if [ -f "$config_file" ]; then
-        filename=$(basename "$config_file")
-        domain=$(echo "$filename" | sed 's/\.conf$//')
-        link_name="vhost-$domain.conf"
-
-        ln -sf "$config_file" "$APACHE_SITES_DIR/$link_name"
-
-        # Enable the site (quiet: it is usually already enabled)
-        a2ensite -q "$link_name" > /dev/null
-    fi
-done
-
-# Test Apache configuration
-if apache2ctl configtest > /dev/null 2>&1; then
-    systemctl reload apache2
-    echo "Virtual hosts synchronized successfully!"
-else
-    echo "Apache configuration test failed. Please check the configurations:"
-    apache2ctl configtest
-    exit 1
-fi
-EOL
-
-# Create vhost listing script
-cat > /usr/local/bin/vhost-manager/list-vhosts.sh << 'EOL'
-#!/bin/bash
-
-# List all virtual hosts
-
-echo "=== Available Virtual Hosts ==="
-echo ""
-
-VHOST_DIR="/var/www/shared/vhosts"
-CONFIG_DIR="/var/www/shared/vhost-configs"
-
-if [ -d "$VHOST_DIR" ]; then
-    for vhost in "$VHOST_DIR"/*; do
-        if [ -d "$vhost" ]; then
-            domain=$(basename "$vhost")
-            config_file="$CONFIG_DIR/$domain.conf"
-            
-            echo "Domain: $domain"
-            echo "  Document Root: $vhost/public_html"
-            echo "  Configuration: $config_file"
-            
-            if [ -f "$config_file" ]; then
-                if grep -q "SSLEngine on" "$config_file"; then
-                    echo "  SSL: Enabled"
-                else
-                    echo "  SSL: Disabled"
-                fi
-            else
-                echo "  Status: Configuration missing"
-            fi
-            
-            if apache2ctl -S 2>/dev/null | grep -q "$domain"; then
-                echo "  Apache Status: Enabled"
-            else
-                echo "  Apache Status: Disabled"
-            fi
-            
-            echo ""
-        fi
-    done
-else
-    echo "No virtual hosts directory found."
-fi
-EOL
-
-# Create vhost removal script
-cat > /usr/local/bin/vhost-manager/remove-vhost.sh << 'EOL'
-#!/bin/bash
-
-# Virtual Host Removal Script
-# Usage: ./remove-vhost.sh <domain> [--purge]
-#
-# By default website content is PRESERVED. Pass --purge to also delete
-# the content directory, or answer the interactive prompt.
-
-DOMAIN=$1
-PURGE=$2
-
-if [ -z "$DOMAIN" ]; then
-    echo "Usage: $0 <domain> [--purge]"
-    echo "Example: $0 example.com"
-    exit 1
-fi
-
-SAFE_DOMAIN=$(echo "$DOMAIN" | sed 's/[^a-zA-Z0-9.-]//g')
-VHOST_DIR="/var/www/shared/vhosts/$SAFE_DOMAIN"
-CONFIG_FILE="/var/www/shared/vhost-configs/$SAFE_DOMAIN.conf"
-APACHE_LINK="/etc/apache2/sites-available/vhost-$SAFE_DOMAIN.conf"
-
-echo "Removing virtual host for: $DOMAIN"
-
-# Disable Apache site on this server
-if [ -f "$APACHE_LINK" ] || [ -L "$APACHE_LINK" ]; then
-    a2dissite -q "vhost-$SAFE_DOMAIN.conf" > /dev/null 2>&1
-    rm -f "$APACHE_LINK"
-fi
-
-# Remove configuration from EFS (other servers clean up on their next
-# vhost-sync.timer run, within one minute)
-if [ -f "$CONFIG_FILE" ]; then
-    rm -f "$CONFIG_FILE"
-    echo "Removed configuration file: $CONFIG_FILE"
-fi
-
-# Decide whether to remove content
-REMOVE_CONTENT="no"
-if [ "$PURGE" = "--purge" ]; then
-    REMOVE_CONTENT="yes"
-elif [ -t 0 ]; then
-    read -p "Do you want to remove the website content in $VHOST_DIR? (y/N): " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] && REMOVE_CONTENT="yes"
-fi
-
-if [ "$REMOVE_CONTENT" = "yes" ]; then
-    rm -rf "$VHOST_DIR"
-    echo "Removed website content: $VHOST_DIR"
-else
-    echo "Website content preserved: $VHOST_DIR"
-    echo "(run with --purge to delete it)"
-fi
-
-# Reload Apache
-systemctl reload apache2
-echo "Virtual host removed and Apache reloaded."
-EOL
-
-# Make all scripts executable
-chmod +x /usr/local/bin/vhost-manager/*.sh
-
-# Create main vhost management command
-cat > /usr/local/bin/vhost << 'EOL'
-#!/bin/bash
-
-# Main vhost management command
-
-case "$1" in
-    create)
-        shift
-        /usr/local/bin/vhost-manager/create-vhost.sh "$@"
-        ;;
-    sync)
-        /usr/local/bin/vhost-manager/sync-vhosts.sh
-        ;;
-    list)
-        /usr/local/bin/vhost-manager/list-vhosts.sh
-        ;;
-    remove)
-        shift
-        /usr/local/bin/vhost-manager/remove-vhost.sh "$@"
-        ;;
-    *)
-        echo "Usage: vhost {create|sync|list|remove}"
-        echo ""
-        echo "Commands:"
-        echo "  create <domain> [admin-email]  - Create a new virtual host"
-        echo "  sync                           - Synchronize vhosts from EFS to this server"
-        echo "  list                           - List all virtual hosts"
-        echo "  remove <domain> [--purge]      - Remove a virtual host (--purge deletes content)"
-        echo ""
-        echo "TLS is terminated at the load balancer (ACM); vhosts serve HTTP on port 80."
-        echo "Other web servers pick up changes automatically within one minute."
-        echo ""
-        echo "Examples:"
-        echo "  vhost create example.com"
-        echo "  vhost create example.com admin@example.com"
-        echo "  vhost sync"
-        echo "  vhost list"
-        echo "  vhost remove example.com"
-        exit 1
-        ;;
-esac
-EOL
-
-chmod +x /usr/local/bin/vhost
+cp /opt/provisioning/scripts/vhost-manager/create-vhost.sh \
+   /opt/provisioning/scripts/vhost-manager/sync-vhosts.sh \
+   /opt/provisioning/scripts/vhost-manager/list-vhosts.sh \
+   /opt/provisioning/scripts/vhost-manager/remove-vhost.sh \
+   /usr/local/bin/vhost-manager/
+cp /opt/provisioning/scripts/vhost-manager/vhost /usr/local/bin/vhost
+chmod +x /usr/local/bin/vhost-manager/*.sh /usr/local/bin/vhost
 
 # Create vhost sync timer for automatic synchronization.
 #
 # NOTE: inotify cannot be used here. inotify only reports changes made by
 # the local NFS client; edits made on *other* web servers (or via EFS
 # directly) never generate events. A short polling interval is the reliable
-# way to converge all servers on the shared configuration.
+# way to converge all servers on the shared configuration. The sync script
+# exits early (no Apache reload) when nothing has changed.
 cat > /etc/systemd/system/vhost-sync.service << 'EOL'
 [Unit]
 Description=Synchronize Apache virtual hosts from EFS
@@ -445,11 +240,7 @@ systemctl daemon-reload
 systemctl enable --now vhost-sync.timer
 
 # Initial vhost sync
-/usr/local/bin/vhost-manager/sync-vhosts.sh
-
-# Install CloudWatch agent
-wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-dpkg -i -E ./amazon-cloudwatch-agent.deb
+/usr/local/bin/vhost-manager/sync-vhosts.sh --force
 
 # Configure log rotation
 cat > /etc/logrotate.d/apache2-custom << 'EOL'
@@ -467,5 +258,82 @@ cat > /etc/logrotate.d/apache2-custom << 'EOL'
     endscript
 }
 EOL
+
+# ---------------------------------------------------------------------------
+# Prometheus node_exporter: host CPU / RAM / disk / network metrics (:9100).
+# Scraped by the monitoring server; the port is only reachable from the
+# monitoring security group.
+# ---------------------------------------------------------------------------
+NODE_EXPORTER_VERSION="1.8.2"
+useradd --no-create-home --shell /usr/sbin/nologin node_exporter || true
+# Skip the download when the binary is pre-baked into the AMI (see packer/)
+if [ ! -x /usr/local/bin/node_exporter ]; then
+    cd /tmp
+    fetch_release "https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION" \
+        "node_exporter-$NODE_EXPORTER_VERSION.linux-amd64.tar.gz"
+    tar xzf node_exporter-$NODE_EXPORTER_VERSION.linux-amd64.tar.gz
+    mv node_exporter-$NODE_EXPORTER_VERSION.linux-amd64/node_exporter /usr/local/bin/
+fi
+
+cat > /etc/systemd/system/node_exporter.service << 'NODEEOF'
+[Unit]
+Description=Prometheus Node Exporter
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+NODEEOF
+
+systemctl daemon-reload
+systemctl enable --now node_exporter
+
+# ---------------------------------------------------------------------------
+# Apache metrics: mod_status (localhost only) + apache_exporter (:9117).
+# Exposes request rate, worker/scoreboard state, throughput, and uptime.
+# ---------------------------------------------------------------------------
+a2enmod status
+cat > /etc/apache2/conf-available/server-status-local.conf << 'STATUSEOF'
+ExtendedStatus On
+<Location /server-status>
+    Require local
+</Location>
+STATUSEOF
+a2enconf server-status-local
+systemctl reload apache2
+
+APACHE_EXPORTER_VERSION="1.0.8"
+useradd --no-create-home --shell /usr/sbin/nologin apache_exporter || true
+# Skip the download when the binary is pre-baked into the AMI (see packer/)
+if [ ! -x /usr/local/bin/apache_exporter ]; then
+    cd /tmp
+    fetch_release "https://github.com/Lusitaniae/apache_exporter/releases/download/v$APACHE_EXPORTER_VERSION" \
+        "apache_exporter-$APACHE_EXPORTER_VERSION.linux-amd64.tar.gz"
+    tar xzf apache_exporter-$APACHE_EXPORTER_VERSION.linux-amd64.tar.gz
+    mv apache_exporter-$APACHE_EXPORTER_VERSION.linux-amd64/apache_exporter /usr/local/bin/
+fi
+
+cat > /etc/systemd/system/apache_exporter.service << 'APACHEEOF'
+[Unit]
+Description=Prometheus Apache Exporter
+After=network-online.target apache2.service
+
+[Service]
+User=apache_exporter
+Group=apache_exporter
+ExecStart=/usr/local/bin/apache_exporter --scrape_uri="http://localhost/server-status?auto" --telemetry.address=":9117"
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+APACHEEOF
+
+systemctl daemon-reload
+systemctl enable --now apache_exporter
 
 echo "Web server setup completed successfully"

@@ -45,8 +45,10 @@ resource "aws_ssm_parameter" "db_app_password" {
 
 # ---------------------------------------------------------------------------
 # EC2 instance roles. All instances get SSM Session Manager (auditable
-# access without SSH keys) and CloudWatch agent permissions. The database
-# role can additionally read the DB secrets and write backups to S3.
+# access without SSH keys). The database role can additionally read the DB
+# secrets and write backups to S3. Metrics are handled by Prometheus
+# exporters (see monitoring.tf), so no CloudWatch agent permissions are
+# needed.
 # ---------------------------------------------------------------------------
 
 data "aws_iam_policy_document" "ec2_assume" {
@@ -75,11 +77,6 @@ resource "aws_iam_role_policy_attachment" "web_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_role_policy_attachment" "web_cloudwatch" {
-  role       = aws_iam_role.web.name
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
-}
-
 resource "aws_iam_instance_profile" "web" {
   name_prefix = "${var.project_name}-${var.environment}-web-"
   role        = aws_iam_role.web.name
@@ -99,11 +96,6 @@ resource "aws_iam_role" "database" {
 resource "aws_iam_role_policy_attachment" "database_ssm" {
   role       = aws_iam_role.database.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-}
-
-resource "aws_iam_role_policy_attachment" "database_cloudwatch" {
-  role       = aws_iam_role.database.name
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
 data "aws_iam_policy_document" "database_secrets" {
@@ -157,9 +149,27 @@ resource "aws_iam_role_policy_attachment" "bastion_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_role_policy_attachment" "bastion_cloudwatch" {
-  role       = aws_iam_role.bastion.name
-  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+# Read-only instance discovery so bastion management tools can find the
+# fleet by tags at runtime instead of relying on hardcoded IPs.
+# ec2:DescribeInstances does not support resource-level scoping.
+data "aws_iam_policy_document" "bastion_discovery" {
+  statement {
+    sid       = "DiscoverFleet"
+    actions   = ["ec2:DescribeInstances"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.aws_region]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "bastion_discovery" {
+  name_prefix = "fleet-discovery-"
+  role        = aws_iam_role.bastion.id
+  policy      = data.aws_iam_policy_document.bastion_discovery.json
 }
 
 resource "aws_iam_instance_profile" "bastion" {

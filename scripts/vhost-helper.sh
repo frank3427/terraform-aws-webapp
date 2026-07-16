@@ -6,28 +6,60 @@
 set -e
 
 # Configuration - Update these values from your Terraform outputs
-JUMP_HOST=""  # Bastion host public IP from terraform output
-WEB_SERVERS=""  # Private IPs of web servers from terraform output  
-SSH_KEY=""  # Path to your SSH private key
+JUMP_HOST=""    # Bastion host public IP (terraform output bastion_public_ip)
+WEB_SERVERS="auto"  # Space-separated private IPs, or "auto" to discover via AWS CLI
+SSH_KEY=""      # Path to your SSH private key
 SSH_USER="ubuntu"
 
-# Function to execute command on all web servers
-execute_on_all_servers() {
-    local command="$1"
-    local servers=($WEB_SERVERS)
-    
-    for server in "${servers[@]}"; do
-        echo "Executing on $server: $command"
-        if [ -n "$JUMP_HOST" ]; then
-            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-                -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
-                "$SSH_USER@$server" "$command"
-        else
-            ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-                "$SSH_USER@$server" "$command"
-        fi
+# Used only when WEB_SERVERS="auto"
+AWS_REGION="${AWS_REGION:-us-west-2}"
+ENVIRONMENT="${ENVIRONMENT:-production}"
+
+# Auto-discover web servers by tag (requires AWS CLI credentials with
+# ec2:DescribeInstances). The web tier is an ASG, so IPs change as
+# instances are replaced - "auto" is the reliable option.
+if [ "$WEB_SERVERS" = "auto" ]; then
+    WEB_SERVERS=$(aws ec2 describe-instances --region "$AWS_REGION" \
+        --filters "Name=tag:Type,Values=WebServer" \
+                  "Name=tag:Environment,Values=$ENVIRONMENT" \
+                  "Name=instance-state-name,Values=running" \
+        --query 'Reservations[].Instances[].[Tags[?Key==`Name`]|[0].Value,PrivateIpAddress]' \
+        --output text | sort -V | awk '{print $2}' | tr '\n' ' ')
+    if [ -z "${WEB_SERVERS// /}" ]; then
+        echo "Auto-discovery found no running web servers (region=$AWS_REGION, environment=$ENVIRONMENT)."
+        echo "Set WEB_SERVERS manually in this script or check AWS credentials."
+        exit 1
+    fi
+    echo "Discovered web servers: $WEB_SERVERS"
+fi
+
+# Run a command on one server, optionally via the bastion jump host
+run_on() {
+    local server="$1"
+    shift
+    if [ -n "$JUMP_HOST" ]; then
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+            -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
+            "$SSH_USER@$server" "$@"
+    else
+        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+            "$SSH_USER@$server" "$@"
+    fi
+}
+
+# Run a command on every web server
+run_on_all() {
+    local server
+    for server in $WEB_SERVERS; do
+        echo "Executing on $server: $*"
+        run_on "$server" "$@"
         echo "---"
     done
+}
+
+# Return the first web server (vhost changes propagate via EFS)
+first_server() {
+    echo "$WEB_SERVERS" | cut -d' ' -f1
 }
 
 # Function to create a virtual host
@@ -43,21 +75,12 @@ create_vhost() {
     echo "Creating virtual host for: $domain"
 
     # Create vhost on first server (it will be shared via EFS)
-    local first_server=$(echo $WEB_SERVERS | cut -d' ' -f1)
     local cmd="sudo vhost create $domain"
     [ -n "$email" ] && cmd="$cmd $email"
-
-    if [ -n "$JUMP_HOST" ]; then
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-            -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
-            "$SSH_USER@$first_server" "$cmd"
-    else
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-            "$SSH_USER@$first_server" "$cmd"
-    fi
+    run_on "$(first_server)" "$cmd"
 
     echo ""
-    echo "Virtual host created on $first_server."
+    echo "Virtual host created on $(first_server)."
     echo "The remaining servers will sync automatically within one minute."
     echo "To force an immediate sync everywhere, run: $0 sync"
 }
@@ -65,16 +88,7 @@ create_vhost() {
 # Function to list virtual hosts
 list_vhosts() {
     echo "Listing virtual hosts from first server..."
-    local first_server=$(echo $WEB_SERVERS | cut -d' ' -f1)
-    
-    if [ -n "$JUMP_HOST" ]; then
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-            -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
-            "$SSH_USER@$first_server" "sudo vhost list"
-    else
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-            "$SSH_USER@$first_server" "sudo vhost list"
-    fi
+    run_on "$(first_server)" "sudo vhost list"
 }
 
 # Function to remove a virtual host
@@ -94,21 +108,12 @@ remove_vhost() {
     fi
 
     # Remove from first server (config removal propagates via EFS)
-    local first_server=$(echo $WEB_SERVERS | cut -d' ' -f1)
     local cmd="sudo vhost remove $domain"
     [ "$purge" = "--purge" ] && cmd="$cmd --purge"
-
-    if [ -n "$JUMP_HOST" ]; then
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-            -o ProxyCommand="ssh -i $SSH_KEY -W %h:%p $SSH_USER@$JUMP_HOST" \
-            "$SSH_USER@$first_server" "$cmd"
-    else
-        ssh -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
-            "$SSH_USER@$first_server" "$cmd"
-    fi
+    run_on "$(first_server)" "$cmd"
 
     echo ""
-    echo "Virtual host removed on $first_server."
+    echo "Virtual host removed on $(first_server)."
     echo "The remaining servers will stop serving it within one minute."
     echo "To force an immediate sync everywhere, run: $0 sync"
 }
@@ -116,16 +121,16 @@ remove_vhost() {
 # Function to sync virtual hosts
 sync_vhosts() {
     echo "Synchronizing virtual hosts across all servers..."
-    execute_on_all_servers "sudo vhost sync"
+    run_on_all "sudo vhost sync"
     echo "Synchronization complete!"
 }
 
 # Function to check status
 check_status() {
     echo "Checking virtual host status on all servers..."
-    execute_on_all_servers "sudo systemctl status vhost-sync.timer --no-pager"
+    run_on_all "sudo systemctl status vhost-sync.timer --no-pager"
     echo ""
-    execute_on_all_servers "sudo apache2ctl -S"
+    run_on_all "sudo apache2ctl -S"
 }
 
 # Main script logic
@@ -152,7 +157,7 @@ case "$1" in
         echo "Usage: $0 {create|list|remove|sync|status}"
         echo ""
         echo "Before using this script, set the following variables:"
-        echo "  WEB_SERVERS=\"ip1 ip2 ip3\"  # Private IPs of web servers"
+        echo "  WEB_SERVERS=\"ip1 ip2 ip3\"  # Private IPs of web servers (or \"auto\")"
         echo "  SSH_KEY=\"/path/to/key.pem\"  # Path to SSH private key"
         echo "  JUMP_HOST=\"bastion-ip\"      # Optional: bastion host IP"
         echo ""

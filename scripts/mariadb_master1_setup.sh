@@ -5,6 +5,19 @@ set -e
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 
+# Enable automatic security updates (no auto-reboot on database hosts)
+DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOL'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOL
+cat > /etc/apt/apt.conf.d/52unattended-upgrades-local << 'EOL'
+Unattended-Upgrade::Allowed-Origins {
+    "$${distro_id}:$${distro_codename}-security";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+EOL
+
 # Install MariaDB
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
     mariadb-server \
@@ -150,5 +163,111 @@ chmod 700 /usr/local/bin/mariadb_backup.sh
 
 # Add backup to cron (daily at 2 AM)
 echo "0 2 * * * root /usr/local/bin/mariadb_backup.sh" >> /etc/crontab
+
+
+# ---------------------------------------------------------------------------
+# Prometheus node_exporter: host CPU / RAM / disk / network metrics (:9100).
+# Scraped by the monitoring server; the port is only reachable from the
+# monitoring security group.
+# ---------------------------------------------------------------------------
+# Download a release tarball with retries and verify it against the
+# release's sha256sums.txt (hard-fail on mismatch; skip if not published).
+fetch_release() {
+    local base="$1" tarball="$2" sums attempt
+    sums="$tarball.sums"
+    for attempt in 1 2 3 4 5; do
+        if wget -q -O "$tarball" "$base/$tarball"; then
+            if wget -q -O "$sums" "$base/sha256sums.txt"; then
+                if awk -v f="$tarball" '{ sub(/^\*/, "", $2) } $2 == f { print $1 "  " f }' "$sums" | sha256sum -c --status; then
+                    rm -f "$sums"; return 0
+                fi
+                echo "ERROR: checksum mismatch for $tarball (attempt $attempt/5)" >&2
+                rm -f "$tarball" "$sums"
+            else
+                echo "WARN: no sha256sums.txt for $tarball; proceeding unverified" >&2
+                rm -f "$sums"; return 0
+            fi
+        fi
+        echo "Download of $tarball failed (attempt $attempt/5); retrying in 15s..." >&2
+        sleep 15
+    done
+    echo "FATAL: could not download and verify $tarball" >&2
+    return 1
+}
+
+NODE_EXPORTER_VERSION="1.8.2"
+useradd --no-create-home --shell /usr/sbin/nologin node_exporter || true
+cd /tmp
+fetch_release "https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION" \
+    "node_exporter-$NODE_EXPORTER_VERSION.linux-amd64.tar.gz"
+tar xzf node_exporter-$NODE_EXPORTER_VERSION.linux-amd64.tar.gz
+mv node_exporter-$NODE_EXPORTER_VERSION.linux-amd64/node_exporter /usr/local/bin/
+
+cat > /etc/systemd/system/node_exporter.service << 'NODEEOF'
+[Unit]
+Description=Prometheus Node Exporter
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+NODEEOF
+
+systemctl daemon-reload
+systemctl enable --now node_exporter
+
+# ---------------------------------------------------------------------------
+# MariaDB metrics: mysqld_exporter (:9104) with a dedicated local-only,
+# least-privilege monitoring user. Exposes connections, query rates,
+# InnoDB stats, and replication status/lag.
+# ---------------------------------------------------------------------------
+EXPORTER_DB_PASSWORD=$(openssl rand -hex 16)
+mysql -e "
+CREATE USER IF NOT EXISTS 'exporter'@'localhost' IDENTIFIED BY '$EXPORTER_DB_PASSWORD' WITH MAX_USER_CONNECTIONS 3;
+GRANT PROCESS, REPLICATION CLIENT, SLAVE MONITOR ON *.* TO 'exporter'@'localhost';
+GRANT SELECT ON performance_schema.* TO 'exporter'@'localhost';
+FLUSH PRIVILEGES;
+"
+
+MYSQLD_EXPORTER_VERSION="0.16.0"
+useradd --no-create-home --shell /usr/sbin/nologin mysqld_exporter || true
+cd /tmp
+fetch_release "https://github.com/prometheus/mysqld_exporter/releases/download/v$MYSQLD_EXPORTER_VERSION" \
+    "mysqld_exporter-$MYSQLD_EXPORTER_VERSION.linux-amd64.tar.gz"
+tar xzf mysqld_exporter-$MYSQLD_EXPORTER_VERSION.linux-amd64.tar.gz
+mv mysqld_exporter-$MYSQLD_EXPORTER_VERSION.linux-amd64/mysqld_exporter /usr/local/bin/
+
+mkdir -p /etc/mysqld_exporter
+cat > /etc/mysqld_exporter/my.cnf << EXPCNF
+[client]
+user=exporter
+password=$EXPORTER_DB_PASSWORD
+host=localhost
+EXPCNF
+chown -R mysqld_exporter:mysqld_exporter /etc/mysqld_exporter
+chmod 600 /etc/mysqld_exporter/my.cnf
+
+cat > /etc/systemd/system/mysqld_exporter.service << 'MYSQLDEOF'
+[Unit]
+Description=Prometheus MySQL Exporter
+After=network-online.target mariadb.service
+
+[Service]
+User=mysqld_exporter
+Group=mysqld_exporter
+ExecStart=/usr/local/bin/mysqld_exporter --config.my-cnf=/etc/mysqld_exporter/my.cnf --web.listen-address=":9104"
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+MYSQLDEOF
+
+systemctl daemon-reload
+systemctl enable --now mysqld_exporter
 
 echo "MariaDB Master 1 setup completed successfully"

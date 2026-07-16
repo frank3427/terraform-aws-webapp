@@ -8,11 +8,15 @@ items that remain your responsibility, with transactional workloads in mind.
 ### Edge protection
 - **HTTPS termination at the ALB** with an ACM certificate (auto-renewing);
   HTTP is 301-redirected to HTTPS when a certificate is configured
-- **AWS WAF** (toggle: `enable_waf`) with AWS managed rule groups: Common
-  Rule Set, Known Bad Inputs, SQL injection, and the Amazon IP reputation
-  list
-- ALB **drops malformed headers** (request-smuggling defense) and has
-  **deletion protection** enabled by default
+- **AWS WAF** (toggle: `enable_waf`) with a rate-based rule (2000 req/5min
+  per IP, blocking brute force and credential stuffing) plus AWS managed
+  rule groups: Common Rule Set, Known Bad Inputs, SQL injection, and the
+  Amazon IP reputation list. WAF decisions are logged to CloudWatch
+  (90-day retention) for attack investigation and false-positive tuning
+- ALB **drops malformed headers** (request-smuggling defense), has
+  **deletion protection** enabled by default, and writes **access logs**
+  (request-level HTTP audit trail) to a dedicated encrypted S3 bucket with
+  90-day retention
 - Apache sends baseline security headers (HSTS on HTTPS traffic,
   `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`) and does
   not advertise software versions (`ServerTokens Prod`, `expose_php Off`)
@@ -29,9 +33,30 @@ items that remain your responsibility, with transactional workloads in mind.
   **least-privilege grants** on the `webapp` schema only, restricted to the
   web server subnets; the replication user can connect only from the peer
   master's IP
-- Terraform state still contains the secret values: use the encrypted S3
-  backend (see the commented block in `main.tf`) and restrict access to the
-  state bucket
+- Terraform state still contains the secret values: create the encrypted,
+  versioned state bucket with the one-time `bootstrap/` config, wire it
+  into the backend block in `main.tf`, and restrict access to the bucket
+- The generated Grafana admin password is stored as an SSM SecureString
+  (`/<project>/<environment>/monitoring/grafana_admin_password`)
+
+### Monitoring plane
+- The Prometheus/Alertmanager/Grafana server sits in a private subnet; its
+  UIs (3000/9090/9093) accept connections only from the bastion, and
+  exporter ports on the fleet accept connections only from the monitoring
+  security group
+- The MariaDB `exporter` user is localhost-only and least-privilege
+- Alertmanager publishes to SNS using the instance role (sigv4); the role
+  can publish only to the alert topic
+
+### Supply chain
+- Instance provisioning scripts are served from a **private, versioned S3
+  bucket** (`provisioning.tf`); instance roles have read-only access to the
+  `scripts/` prefix
+- Third-party release tarballs (Prometheus, Alertmanager, exporters) are
+  **verified against the release's sha256sums.txt** at install time, with
+  retries; a checksum mismatch aborts provisioning
+- The optional Packer-baked AMI (see packer/) removes boot-time downloads
+  from the critical path entirely
 
 ### Network
 - Web and database servers have no public IPs; the ALB and bastion are the
@@ -54,13 +79,18 @@ items that remain your responsibility, with transactional workloads in mind.
 - **SSM Session Manager** is available on all instances (auditable shell
   access through IAM, no inbound ports); consider it over SSH for routine
   access
+- **Automatic security patching** is enabled on all instances via
+  `unattended-upgrades` (security pocket only, no automatic reboots —
+  schedule reboots for kernel updates yourself)
 - All EBS volumes and the EFS file system are **encrypted at rest**
 
 ### Data protection
 - Nightly database dumps are compressed and shipped to a **dedicated S3
   bucket** with KMS encryption, versioning, public access blocked, and
   35-day lifecycle retention — backups survive instance loss or compromise
-- EFS is encrypted at rest; consider enabling **AWS Backup** for EFS
+- **EFS website content is backed up automatically** via AWS Backup
+  (`aws_efs_backup_policy`), protecting against accidental deletion,
+  a destructive `vhost remove --purge`, or ransomware on a web server
 
 ## Your Responsibilities
 
@@ -74,14 +104,34 @@ items that remain your responsibility, with transactional workloads in mind.
   secure coding — parameterized queries, output encoding, CSRF protection,
   session management (`Secure`/`HttpOnly` cookies), and input validation
   are the application's job.
-- **Patching:** instances install updates at launch only. Enable
-  `unattended-upgrades` or rebuild instances regularly for ongoing patching.
+- **Reboots for kernel updates:** unattended-upgrades applies security
+  patches daily but does not reboot; schedule periodic reboots (or rebuild
+  instances) so kernel patches take effect.
 - **Restrict IAM access** to the Terraform state bucket, SSM parameters
   (`/<project>/<environment>/db/*`), and the backup bucket.
 - **Rotate credentials** periodically: update the variable, run
   `terraform apply` to update SSM, then apply the change inside MariaDB.
 - **Test backup restores.** A backup that has never been restored is a hope,
   not a backup.
+
+## Open Follow-ups
+
+Identified but not yet implemented, in suggested priority order:
+
+1. **SSH key strategy** — one key pair opens every instance. Use separate
+   keys for bastion vs. internal hosts, or prefer SSM Session Manager
+   (already enabled) and disable SSH entirely.
+2. **Account-level controls** (outside this repo's scope): CloudTrail
+   enabled in all regions, GuardDuty, MFA on IAM users, and strict access
+   control on the Terraform state bucket, SSM parameters, and backup
+   buckets.
+3. **WAF rate-limit tuning** — the 2000 req/5min default may need
+   adjustment for legitimate high-traffic clients or shared office NAT IPs;
+   review the WAF logs during the first weeks.
+
+(Resolved in earlier iterations: unconfigured CloudWatch agent removed —
+Prometheus is the metrics plane; alerting implemented via Prometheus
+rules → Alertmanager → SNS, see MONITORING.md.)
 
 ## Known Trade-offs
 

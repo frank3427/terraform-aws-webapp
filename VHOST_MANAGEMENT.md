@@ -6,9 +6,10 @@ This document provides detailed instructions for managing Apache virtual hosts i
 
 The infrastructure includes an automated virtual host management system that:
 - Stores all website content and configurations on EFS (shared across all servers)
-- Automatically synchronizes Apache configurations across all web servers (within one minute)
+- Automatically synchronizes Apache configurations across all web servers (within one minute; Apache is only reloaded when something actually changed)
 - Provides simple command-line tools for virtual host management
 - Terminates HTTPS at the load balancer using AWS Certificate Manager (ACM)
+- Survives instance turnover: web servers are an Auto Scaling Group, and every new instance installs the vhost tooling at boot and converges on the shared EFS configuration within a minute
 
 ## Architecture
 
@@ -119,11 +120,22 @@ sudo vhost sync
 ```
 
 The sync:
+- Exits immediately (no Apache reload) if nothing changed since the last
+  successful sync — a state hash of the shared configs and local symlinks
+  is kept in `/var/lib/vhost-sync.state`. `vhost sync` bypasses the check
+  (`--force`); the every-minute timer uses it, so Apache is only reloaded
+  when a vhost actually changed
 - Scans `/var/www/shared/vhost-configs/` for configuration files
 - Creates symlinks in `/etc/apache2/sites-available/` and enables them
 - Cleans up links for vhosts that have been removed
 - Tests the Apache configuration and reloads Apache if it is valid
 - Skips (and reports) if the EFS mount is unavailable
+
+The vhost-manager scripts are versioned in the repo under
+`scripts/vhost-manager/` and installed at boot from the provisioning S3
+bucket (see `provisioning.tf`). Script changes ship on the next
+`terraform apply` for newly launched instances; update running servers by
+re-copying via SSM or the bastion.
 
 > **Why a timer instead of file-watching?** inotify only sees changes made
 > by the local machine — changes written by *other* NFS clients never
@@ -150,7 +162,7 @@ irreversible and affects all servers, since content lives on shared EFS.
 ```
 /var/www/shared/
 ├── vhosts/                    # Website content directories
-│   ├── default/               # Default virtual host (ALB health checks)
+│   ├── default/               # Default virtual host (unmatched domains)
 │   │   └── index.php
 │   └── example.com/
 │       └── public_html/       # Document root for example.com
@@ -298,7 +310,7 @@ sudo apache2ctl -t -D DUMP_VHOSTS
 
 1. **Always use the vhost command** instead of manually editing Apache configurations
 2. **Test configurations** before deploying to production
-3. **Backup EFS regularly** — consider AWS Backup for EFS
+3. **EFS backups are automatic** via AWS Backup (`aws_efs_backup_policy`) — verify restore procedures periodically
 4. **Be careful with `--purge`** — content deletion is shared across all servers and irreversible
 5. **Keep certificates in ACM** — never place private keys on EFS or instances
 6. **Monitor the sync timer** (`systemctl list-timers`) to ensure automatic synchronization works
@@ -329,12 +341,13 @@ $isHttps = ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https';
 
 ### Load Balancer Health Checks
 
-The load balancer performs health checks on `/` of each server over HTTP.
-The default virtual host answers these requests; make sure it always
-returns 200:
+The load balancer probes `/healthz` on each server over HTTP. The path is
+an Apache alias to a static file on the instance's local disk — deliberately
+independent of EFS and PHP, so a shared-storage stall can't fail health
+checks fleet-wide. Verify on a server:
 
 ```bash
-curl -H "Host: default.local" http://localhost/
+curl http://localhost/healthz    # expect: OK
 ```
 
 ### Multiple Domains per Virtual Host
